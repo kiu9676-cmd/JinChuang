@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/kiu9676-cmd/JinChuang/releases/latest/download/default.exe">下载 Windows 版</a> ·
-  <a href="https://github.com/kiu9676-cmd/JinChuang/archive/refs/tags/v1.6.2.zip">下载 v1.6.2 源码</a> ·
+  <a href="https://github.com/kiu9676-cmd/JinChuang/archive/refs/tags/v1.6.3.zip">下载 v1.6.3 源码</a> ·
   <a href="docs/SHOWCASE.md">功能图览</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="docs/USAGE.md">使用手册</a> ·
@@ -37,7 +37,7 @@
 
 ## 快速开始
 
-**Windows 便携版**：从 [GitHub Release](https://github.com/kiu9676-cmd/JinChuang/releases/tag/v1.6.2) 下载 `default.exe`。从旧版升级时先退出托盘里的旧程序，新版放在原目录运行即可继续使用原有 `data/`。也可在旧版里通过「设置 → 更新」升级。
+**Windows 便携版**：从 [GitHub Release](https://github.com/kiu9676-cmd/JinChuang/releases/tag/v1.6.3) 下载 `default.exe`。从旧版升级时先退出托盘里的旧程序，新版放在原目录运行即可继续使用原有 `data/`。也可在旧版里通过「设置 → 更新」升级。
 
 **从源码运行**：推荐使用 **Python 3.12**。在两台设备上各运行一份：
 

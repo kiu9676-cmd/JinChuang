@@ -30,7 +30,10 @@ function closeChatSearch(focus = false){
   $('messages').inert = false;
   $('messages').removeAttribute('aria-hidden');
   updateScrollPill();
-  if(focus) $('btnChatSearch').focus();
+  if(focus){
+    $('btnChatSearch').focus();
+    acknowledgeVisibleChat(); renderPeers(); renderTitle();
+  }
 }
 
 function renderChatSearch(){

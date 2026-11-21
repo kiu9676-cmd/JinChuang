@@ -43,6 +43,28 @@ async function API(path, body){
                                 body: JSON.stringify(body || {}) });
   return r.json();
 }
+const readPending = new Map();
+function viewingChat(id){
+  return !!id && current === id && surface === 'chats' && document.visibilityState === 'visible' &&
+    document.hasFocus() && ['chatSearchPanel','modalMask','lightbox','mjFrameMask','gameMask']
+      .every(key => $(key).classList.contains('hidden'));
+}
+function acknowledgeVisibleChat(){
+  const pid = current;
+  if(!viewingChat(pid) || !(unread[pid] || S.unread?.[pid])) return;
+  delete unread[pid];
+  const through = (S.messages[pid] || []).findLast(m => m.dir === 'in')?.msgId ?? null;
+  if(readPending.has(pid) && readPending.get(pid) === through) return;
+  readPending.set(pid,through);
+  const counts = S.unread;
+  API('/api/read',{id:pid,through}).then(result => {
+    if(result.stale){ getState(); }
+    else if(result.ok && counts && S.unread === counts){ delete counts[pid]; }
+  }).catch(() => {}).finally(() => {
+    if(readPending.get(pid) === through) readPending.delete(pid);
+  });
+}
+
 /* 全局状态拉取：带序号防乱序（旧快照后到会把刚发出的消息“吞”掉） */
 let stateSeq = 0;
 async function getState(){
@@ -56,13 +78,14 @@ async function getState(){
       const n = (d.messages[p.id] || []).length;
       if(prevCounts[p.id] !== undefined && n > prevCounts[p.id]){
         const last = (d.messages[p.id] || [])[n-1];
-        if(last && last.dir === 'in' && current !== p.id) onNewMessage(p, last);
+        if(last && last.dir === 'in' && !viewingChat(p.id)) onNewMessage(p, last);
       }
       prevCounts[p.id] = n;
     }
     S = d;
     syncAppearanceFromState();
     unread = Object.assign({}, d.unread || {});
+    acknowledgeVisibleChat();
     // 合并本地发送任务，避免全量刷新覆盖实时进度
     for(const t of Object.values(outTasks)){
       const i = S.transfers.findIndex(x => x.id === t.id);
@@ -129,6 +152,14 @@ function connectWS(){
       if(i >= 0) S.transfers[i] = t; else S.transfers.push(t);
       if(t.retryable && t.peerId === current) renderMessages();
       renderTransfers(); updateBubbleProgress(t.msgId, taskPct(t));
+    }
+    else if(m.type === 'forward-progress'){
+      const t = outTasks[m.id];
+      if(t && t.status === 'running' && !t.preparing){
+        t.doneBytes = (t.baseBytes || 0) + m.bytes;
+        t.speed = m.speed;
+        renderTransfers(); updateBubbleProgress(t.msgId, taskPct(t));
+      }
     }
     else if(m.type === 'toast') toast(m.from + ' ' + m.text);
     else if(m.type === 'hello') setHint('本地服务已连接');
@@ -504,6 +535,7 @@ function tStatusText(t){
     verifying:'正在校验', waiting:'等待对方继续', error:'已中断',
     canceling:'正在取消', cancel_wait:'等待接收端清理', canceled:'已取消', done:'已完成'
   };
+  if(t.preparing && t.status === 'running') return '正在读取本机文件';
   if(t.status === 'running') return t.speed ? fmtSpeed(t.speed) : (t.direction === 'in' ? '接收中' : '传输中');
   return labels[t.status] || '等待确认';
 }
@@ -847,9 +879,10 @@ function selectPeer(id){
   chatScroll = null;
   saveDraft();
   if(current !== id){ closeChatSearch(); msgSig = ''; seenMessages.clear(); }
-  current = id; unread[id] = 0; setReply(null);
+  current = id; setReply(null);
   loadDraft(id);
-  API('/api/read', { id });
+  $('input').focus({preventScroll:true});
+  acknowledgeVisibleChat();
   renderPeers(); renderHeader(); renderMessages(true); renderTitle();
   requestAnimationFrame(() => scrollMessagesToBottom(false));
   $('input').focus({preventScroll:true});
@@ -1000,25 +1033,24 @@ async function sendFileToGroup(item, gid, reply){
     /\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)$/i.test(item.name);
   const mid = uid('m-');
   const task = { id: uid('t-'), direction:'out', peerId:gid, name:item.name, rel:item.rel,
-    size:item.file.size, doneBytes:0, baseBytes:0, speed:0, status:'running',
+    size:item.file.size*targets.length, doneBytes:0, baseBytes:0, speed:0, status:'running',
     start:Date.now()/1000, msgId:mid, kind:isImage?'image':'file' };
-  outTasks[task.id] = task;
-  let media = '';
-  try{ media = await cacheFile(item.name, item.file); }catch(e){}
+  trackOutTask(task);
   const bubble = { msgId:mid, dir:'out', type:isImage?'image':'file', text:'',
-    fileName:item.name, size:item.file.size, media, time:Date.now(),
+    fileName:item.name, size:item.file.size, media:'', time:Date.now(),
     status:'sending', progress:0 };
   (pendingMap[gid] = pendingMap[gid] || []).push(bubble);
   renderMessages(); renderTransfers();
 
-  let done = 0, lastRemote = '';
+  let done = 0;
+  const remoteByPeer = Object.create(null);
   try{
+    task.preparing = true;
+    const staged = await cacheFileInfo(item.name,item.file,{progress:taskInputProgress(task)});
+    task.preparing = false; task.doneBytes = 0; bubble.media = staged.path;
     for(const peer of targets){
       task.baseBytes = done;
-      lastRemote = await uploadTo(peer, item, task, () => {
-        bubble.progress = pct(task);
-        renderTransfers(); updateBubbleProgress(mid, pct(task));
-      }, { silent: 1 });
+      remoteByPeer[peer.id] = await uploadTo(peer,item,task,staged,{silent:1});
       done += item.file.size;
       task.doneBytes = done;
       task.speed = 0;
@@ -1027,13 +1059,13 @@ async function sendFileToGroup(item, gid, reply){
     task.status = 'done';
     bubble.progress = 100;
     const payload = { groupId: gid, type: bubble.type, msgId: mid,
-      fileName: item.name, size: item.file.size, media, peerMedia: lastRemote,
+      fileName: item.name, size: item.file.size, media: staged.path, peerMediaById: remoteByPeer,
       time: bubble.time };
     if(reply) payload.reply = reply;
     const r = await API('/api/group/send', payload);
     if(!r || !r.ok) throw new Error((r && r.error) || '发送失败');
   }catch(e){
-    task.status = 'error'; bubble.status = 'failed';
+    task.status = 'error'; task.preparing = false; task.error = String(e.message || e); bubble.status = 'failed';
     throw e;
   }finally{
     const arr = pendingMap[gid] || [];
@@ -1083,14 +1115,57 @@ function copyText(t){
 }
 
 /* ---------------- 发送文件 / 图片 / 文件夹 ---------------- */
-async function cacheFileInfo(name, file){
-  const r = await fetch('/api/cache?name=' + encodeURIComponent(name), {
-    method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:file });
-  const d = await r.json();
-  if(!r.ok || !d.ok || !d.path) throw new Error(d.error || '本机文件缓存失败');
-  return d;
+async function cacheFileInfo(name, file, options = {}){
+  const started = await API('/api/cache/start', {name,size:file.size,temporary:!!options.temporary});
+  if(!started.ok || !started.id || !Number.isInteger(started.chunkSize) || started.chunkSize < 1 ||
+     started.chunkSize > 4 * 1024 * 1024) throw new Error(started.error || '本机缓存初始化失败');
+  const id = started.id;
+  try{
+    for(let offset=0; offset<file.size;){
+      const end = Math.min(offset+started.chunkSize,file.size);
+      const params = new URLSearchParams({id,offset});
+      let response;
+      try{
+        response = await fetch('/api/cache/append?' + params, {
+          method:'POST', headers:{'Content-Type':'application/octet-stream'}, body:file.slice(offset,end)
+        });
+      }catch(error){ throw new Error('读取本机文件时连接中断；这一步尚未发送给对方。',{cause:error}); }
+      const chunk = await response.json();
+      if(!response.ok || !chunk.ok || chunk.offset !== end) throw new Error(chunk.error || '本机分块未写入');
+      offset = end;
+      options.progress?.(offset);
+    }
+    const staged = await API('/api/cache/finish',{id});
+    if(!staged.ok || (options.temporary ? !staged.stageId : !staged.path)){
+      throw new Error(staged.error || '本机缓存未完成');
+    }
+    return staged;
+  }catch(error){
+    API('/api/cache/discard',{id}).catch(() => {});
+    throw error;
+  }
 }
-async function cacheFile(name, file){ return (await cacheFileInfo(name, file)).path; }
+function trackOutTask(task){
+  outTasks[task.id] = task;
+  S.transfers.push(task);
+  renderTransfers();
+}
+function untrackOutTask(task){
+  delete outTasks[task.id];
+  S.transfers = S.transfers.filter(t => t.id !== task.id);
+  renderTransfers();
+}
+function taskInputProgress(task){
+  let last = 0;
+  return bytes => {
+    task.doneBytes = (task.baseBytes || 0) + bytes;
+    const now = performance.now();
+    if(now - last >= 150){
+      last = now;
+      renderTransfers();
+    }
+  };
+}
 
 async function retryTransfer(id, button){
   if(button) button.disabled = true;
@@ -1153,54 +1228,32 @@ function latestPeer(pid){
   if(!peer) throw new Error('好友已移除，请先重新添加');
   return peer;
 }
-function uploadTo(peer, item, task, onProgress, extra){
-  return new Promise((resolve, reject) => {
-    const q = new URLSearchParams({
-      id: task.id, name: item.name, rel: item.rel, size: String(item.file.size),
-      msgId: task.msgId, from: S.me.id, fromName: S.me.name,
-      kind: task.kind, time: String(task.time || Date.now())
-    });
-    if(extra) for(const [k, v] of Object.entries(extra)) q.set(k, String(v));
-    const url = `http://${peer.ip}:${peer.http}/api/file/upload?${q.toString()}`;
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', url, true);
-    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-    let lastBytes = 0, lastTime = performance.now();
-    const base = task.baseBytes || 0;
-    xhr.upload.onprogress = e => {
-      const now = performance.now(), dt = (now - lastTime)/1000;
-      task.doneBytes = base + e.loaded;
-      task.speed = dt > 0.08 ? (e.loaded - lastBytes)/dt : task.speed;
-      if(dt > 0.08){ lastBytes = e.loaded; lastTime = now; }
-      onProgress();
-    };
-    xhr.onload = () => {
-      if(xhr.status >= 200 && xhr.status < 300){
-        try{ resolve(JSON.parse(xhr.responseText).path || ''); }
-        catch(e){ resolve(''); }
-      } else reject(new Error('HTTP ' + xhr.status));
-    };
-    xhr.onerror = () => reject(new Error('网络不可达'));
-    xhr.onabort = () => reject(new Error('已取消'));
-    xhr.send(item.file);
-  });
+async function uploadTo(peer, item, task, staged, extra){
+  const payload = {peerId:peer.id,id:task.id,msgId:task.msgId,name:item.name,rel:item.rel,
+    kind:task.kind,time:task.time || Date.now(),path:staged.path,stageId:staged.stageId,...extra};
+  const result = await API('/api/transfer/forward',payload);
+  if(!result.ok) throw new Error(result.error || '接收端未确认文件');
+  return result.path;
 }
 
 async function sendOne(item, peer, pid, reply){
   const isImage = /^image\//.test(item.file.type) ||
     /\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)$/i.test(item.name);
   if(peer.resume === true){
+    const task = {id:uid('t-'), direction:'out', peerId:pid, name:item.name, size:item.file.size,
+      kind:isImage ? 'image' : 'file', doneBytes:0, speed:0, status:'running', preparing:true,
+      start:Date.now()/1000};
+    trackOutTask(task);
     try{
-      const staged = await cacheFileInfo(item.name, item.file);
-      const response = await API('/api/transfer/send-file', {
-        peerId:pid, kind:isImage ? 'image' : 'file', name:item.name, ...staged, reply
+      const staged = await cacheFileInfo(item.name,item.file,{progress:taskInputProgress(task)});
+      const response = await API('/api/transfer/send-file',{
+        peerId:pid,kind:task.kind,name:item.name,...staged,reply
       });
       if(!response.ok) throw new Error(response.error || '未能创建发送任务');
+      untrackOutTask(task);
       getState();
     }catch(e){
-      const task = {id:uid('t-'), direction:'out', peerId:pid, name:item.name, size:item.file.size,
-        kind:isImage ? 'image' : 'file', doneBytes:0, status:'error', error:String(e.message || e), start:Date.now()/1000};
-      outTasks[task.id] = task;
+      task.status = 'error'; task.preparing = false; task.error = String(e.message || e);
       rememberRetry(task, () => sendOne(item, latestPeer(pid), pid, reply));
       toast('发送失败：' + task.error);
     }
@@ -1210,30 +1263,27 @@ async function sendOne(item, peer, pid, reply){
   const task = { id:tid, direction:'out', peerId:pid, name:item.name, rel:item.rel,
     size:item.file.size, doneBytes:0, speed:0, status:'running',
     start:Date.now()/1000, msgId:mid, kind:isImage?'image':'file', path:'' };
-  outTasks[tid] = task;
+  trackOutTask(task);
 
   const bubble = { msgId:mid, dir:'out', type:isImage?'image':'file', text:'',
     fileName:item.name, size:item.file.size, media:'', time:Date.now(),
     status:'sending', progress:0 };
   (pendingMap[pid] = pendingMap[pid] || []).push(bubble);
 
-  let media = '';
-  try{ media = await cacheFile(item.name, item.file); }catch(e){}
-  bubble.media = media; task.path = media;
   renderMessages();
-
   try{
-    const remotePath = await uploadTo(peer, item, task, () => {
-      bubble.progress = pct(task);
-      renderTransfers(); renderMessages();
-    });
+    task.preparing = true;
+    const staged = await cacheFileInfo(item.name,item.file,{progress:taskInputProgress(task)});
+    task.preparing = false; task.doneBytes = 0;
+    bubble.media = staged.path; task.path = staged.path;
+    const remotePath = await uploadTo(peer, item, task, staged);
     task.status = 'done'; task.doneBytes = task.size; task.speed = 0;
     bubble.progress = 100;
     await API('/api/send', { to: pid, type: isImage?'image':'file', msgId:mid,
-      fileName:item.name, size:item.file.size, media:media, peerMedia:remotePath,
+      fileName:item.name, size:item.file.size, media:staged.path, peerMedia:remotePath,
       time: bubble.time, ...(reply ? { reply } : {}) });
   }catch(e){
-    task.status = 'error'; task.error = String(e.message || e);
+    task.status = 'error'; task.preparing = false; task.error = String(e.message || e);
     bubble.status = 'failed';
     rememberRetry(task, () => sendOne(item, latestPeer(pid), pid, reply));
     toast('发送失败：' + (e.message || e));
@@ -1287,7 +1337,7 @@ async function sendFolder(peer, group, pid, reply){
   const task = { id:tid, direction:'out', peerId:pid, name:group.name, size:total,
     doneBytes:0, baseBytes:0, speed:0, status:'running', kind:'folder',
     start:Date.now()/1000, msgId:mid, time:Date.now(), fileCount:group.items.length };
-  outTasks[tid] = task;
+  trackOutTask(task);
   const bubble = { msgId:mid, dir:'out', type:'folder', text:'', fileName:group.name,
     size:total, fileCount:group.items.length, media:'', time:Date.now(),
     status:'sending', progress:0 };
@@ -1299,10 +1349,17 @@ async function sendFolder(peer, group, pid, reply){
     for(let i = 0; i < group.items.length; i++){
       const it = group.items[i];
       task.baseBytes = done;
-      await uploadTo(peer, it, task, () => {
-        bubble.progress = pct(task);
-        renderTransfers(); renderMessages();
-      }, { folder: 1, idx: i, count: group.items.length, total });
+      task.preparing = true;
+      const staged = await cacheFileInfo(it.name,it.file,{temporary:true});
+      task.preparing = false;
+      task.doneBytes = done;
+      try{
+        await uploadTo(peer,it,task,staged,{folder:1,idx:i,count:group.items.length,total});
+      }catch(error){
+        throw new Error(it.rel + '：' + (error.message || error),{cause:error});
+      }finally{
+        await API('/api/cache/discard',{id:staged.stageId}).catch(() => {});
+      }
       done += it.file.size;
       task.doneBytes = done;
       task.speed = 0;
@@ -1314,7 +1371,7 @@ async function sendFolder(peer, group, pid, reply){
       fileName: group.name, size: total, fileCount: group.items.length,
       media:'', time: bubble.time, ...(reply ? { reply } : {}) });
   }catch(e){
-    task.status = 'error'; task.error = String(e.message || e);
+    task.status = 'error'; task.preparing = false; task.error = String(e.message || e);
     bubble.status = 'failed';
     rememberRetry(task, () => sendFolder(latestPeer(pid), group, pid, reply));
     toast('文件夹发送失败：' + (e.message || e));
@@ -1493,6 +1550,7 @@ function closeModal(force){
       modalReturnFocus.focus({preventScroll:true});
     }
     modalReturnFocus = null;
+    acknowledgeVisibleChat(); renderPeers(); renderTitle();
   });
 }
 $('modalMask').onclick = e => { if(e.target.id === 'modalMask') closeModal(false); };
@@ -2221,6 +2279,7 @@ function switchSurface(next){
     return;
   }
   renderMessages();
+  acknowledgeVisibleChat(); renderPeers(); renderTitle();
   if(chatScroll){
     if(chatScroll.bottom) scrollMessagesToBottom(false);
     else $('messages').scrollTop = chatScroll.top;
@@ -2396,7 +2455,8 @@ document.addEventListener('dragstart', e => {
 
 /* ---------------- 窗口焦点上报（桌面版：决定是否弹消息卡） ---------------- */
 const reportFocus = v => { if(S.desktop) API('/api/desktop', { action:'focus', value:v }).catch(()=>{}); };
-window.addEventListener('focus', () => reportFocus(true));
+window.addEventListener('focus', () => { reportFocus(true); getState(); });
+document.addEventListener('visibilitychange', () => { if(document.visibilityState === 'visible') getState(); });
 window.addEventListener('blur', () => reportFocus(false));
 
 /* ---------------- 启动 ---------------- */
@@ -2410,7 +2470,7 @@ renderTitle();
 setInterval(() => {
   if(!ws || ws.readyState !== WebSocket.OPEN){
     if(!ws || ws.readyState === WebSocket.CLOSED) getState();
-  } else renderTitle();
+  } else { acknowledgeVisibleChat(); renderPeers(); renderTitle(); }
 }, 5000);
 
 // #settings 深链（也方便自动化截图）：等 /api/state 回来再开，避免读到空配置把昵称存成空

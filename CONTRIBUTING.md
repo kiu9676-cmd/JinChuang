@@ -32,7 +32,7 @@ node --test tests/mahjong-engine.test.cjs tests/clipboard.test.cjs
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
-.\.venv\Scripts\python.exe release.py --build-only --no-git --no-zip --version 1.6.2
+.\.venv\Scripts\python.exe release.py --build-only --no-git --no-zip --version 1.6.3
 ```
 
 产物为 `dist/近传.exe`，也可用 `build.bat` 打包。若要发布新版本，核对 `server.py` 中的版本号、`CHANGELOG.md` 和附件哈希；在 GitHub Release 用 `vX.Y.Z` 作为标签，附上已验证的 `.exe`。派生项目应按需设置自己的更新源。

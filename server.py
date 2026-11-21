@@ -38,13 +38,14 @@ import http.client
 import webbrowser
 import mj
 import ipaddress
+from local_cache import LocalCache
 from transfer_resume import MAX_CHUNK, DIGEST, ChunkStore, TransferError, read_record, write_record
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_NAME = "近传"
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 BUILD_DATE = "2026-11-21"
 WINDOWS_RELEASE_ASSET = "default.exe"
 # 更新源：写死在这里（客户端界面不暴露、不可改）。
@@ -85,6 +86,7 @@ CONFIG = {}
 ME = {}
 UNREAD = {}       # peerId -> 未读数（供托盘提示 / 标题角标）
 RESUME_STORE = None
+LOCAL_CACHE = None
 OUTBOX = {}
 OUTBOX_ACTIVE = set()
 OUTBOX_LOCK = threading.RLock()
@@ -196,12 +198,13 @@ def primary_ip():
 # ----------------------------------------------------------------------------
 def init_store(args):
     global DATA_DIR, DOWNLOAD_DIR, CACHE_DIR, CONFIG, ME, PEERS, MESSAGES
-    global CONFIG_FILE, PEERS_FILE, MESSAGES_FILE, GROUPS_FILE, RESUME_STORE
+    global CONFIG_FILE, PEERS_FILE, MESSAGES_FILE, GROUPS_FILE, RESUME_STORE, LOCAL_CACHE
 
     if args.data_dir:
         DATA_DIR = Path(args.data_dir).resolve()
     RESUME_STORE = ChunkStore(DATA_DIR, lambda: DOWNLOAD_DIR, unique_path)
     CACHE_DIR = DATA_DIR / "cache"
+    LOCAL_CACHE = LocalCache(CACHE_DIR, unique_path, FILE_LOCK)
     CONFIG_FILE = DATA_DIR / "config.json"
     PEERS_FILE = DATA_DIR / "peers.json"
     MESSAGES_FILE = DATA_DIR / "messages.json"
@@ -838,8 +841,26 @@ def resolve_media_path(ref):
     ref = ref.replace("\\", "/")
     if ref.startswith("received/"):
         return RESUME_STORE.media_path(ref)
+    if ref.startswith("legacy-received/"):
+        parts = ref.split("/")
+        if len(parts) != 3 or not DIGEST.fullmatch(parts[1]):
+            return None
+        record = read_record(DATA_DIR / "received-refs" / (parts[1] + ".json"))
+        if not record:
+            return None
+        target = Path(record["path"])
+        return target if target.name == parts[2] else None
     target = (DATA_DIR / safe_rel(ref)).resolve()
     return target if DATA_DIR in target.parents else None
+
+
+def received_reference(path):
+    path = path.resolve()
+    if DATA_DIR in path.parents:
+        return path.relative_to(DATA_DIR).as_posix()
+    key = hashlib.sha256(os.fsencode(path)).hexdigest()
+    write_record(DATA_DIR / "received-refs" / (key + ".json"), {"path": str(path)})
+    return "legacy-received/" + key + "/" + path.name
 
 
 def diagnose_peer(d):
@@ -1294,7 +1315,7 @@ def group_member_peers(g):
     return out
 
 
-def fanout_group(g, path, payload, exclude=None):
+def fanout_group(g, path, payload, exclude=None, media_by_peer=None):
     """把 payload 依次 POST 给群成员（跳过自己/离线/指定的 id）。"""
     sent, failed = 0, 0
     for pid in g.get("members") or []:
@@ -1305,7 +1326,14 @@ def fanout_group(g, path, payload, exclude=None):
             failed += 1
             continue
         try:
-            status, _ = post_to(p, path, payload, timeout=4)
+            wire = payload
+            if media_by_peer is not None:
+                media = media_by_peer.get(pid)
+                if not media:
+                    failed += 1
+                    continue
+                wire = dict(payload, msg=dict(payload["msg"], media=media))
+            status, _ = post_to(p, path, wire, timeout=4)
             if status == 200:
                 sent += 1
             else:
@@ -1378,9 +1406,10 @@ def add_message(peer_id, msg):
         if len(arr) > 800:
             del arr[:len(arr) - 800]
         save_messages()
+        if msg.get("dir") == "in":
+            UNREAD[peer_id] = int(UNREAD.get(peer_id, 0)) + 1
     # 新的入站消息：未读 +1，并通知桌面外壳（右下角消息卡片 / 托盘提示）
     if msg.get("dir") == "in":
-        UNREAD[peer_id] = int(UNREAD.get(peer_id, 0)) + 1
         if DESKTOP:
             try:
                 DESKTOP.on_message(peer_id, msg)
@@ -2447,6 +2476,14 @@ class Handler(BaseHTTPRequestHandler):
             refresh()
             return self._json({"ok": True, "me": dict(ME)})
 
+        if p.startswith("/api/cache/") or p == "/api/transfer/forward":
+            if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                self.close_connection = True
+                return self._json({"ok": False, "error": "此操作只接受本机程序调用"}, 403)
+            if p == "/api/transfer/forward":
+                return self._api_legacy_forward(self._body())
+            return self._api_local_cache(p.rsplit("/", 1)[-1], q)
+
         # 本地 UI：缓存一份即将发送的文件，供自己这边的聊天气泡持久显示
         if p == "/api/cache":
             return self._api_cache(q)
@@ -2482,9 +2519,19 @@ class Handler(BaseHTTPRequestHandler):
 
         # 本地 UI：标记某好友已读（清除未读角标，同时更新托盘/悬浮窗）
         if p == "/api/read":
-            pid = self._body().get("id", "")
-            UNREAD.pop(pid, None)
-            if DESKTOP:
+            d = self._body()
+            pid = d.get("id", "")
+            if not isinstance(pid, str):
+                return self._json({"ok": False, "error": "会话编号无效"}, 400)
+            with FILE_LOCK:
+                last = next((m.get("msgId") for m in reversed(MESSAGES.get(pid, ()))
+                             if m.get("dir") == "in"), None)
+                if "through" in d and last != d["through"]:
+                    return self._json({"ok": True, "stale": True})
+                changed = UNREAD.pop(pid, None)
+            if changed:
+                refresh()
+            if DESKTOP and changed:
                 try:
                     DESKTOP.on_unread()
                 except Exception:
@@ -2704,13 +2751,119 @@ class Handler(BaseHTTPRequestHandler):
                 "reply": out["reply"], "time": out["time"],
             },
         }
-        sent, failed = fanout_group(g, "/api/group/message", payload)
+        media_by_peer = d.get("peerMediaById")
+        if not isinstance(media_by_peer, dict):
+            media_by_peer = None
+        sent, failed = fanout_group(g, "/api/group/message", payload, media_by_peer=media_by_peer)
         out["status"] = "done" if sent else "failed"
         add_message(gid, out)
         g["updatedAt"] = now_ms()
         save_groups()
         return self._json({"ok": sent > 0, "status": out["status"],
                            "sent": sent, "failed": failed})
+
+    def _api_local_cache(self, action, q):
+        try:
+            if action == "append":
+                self.connection.settimeout(30)
+                try:
+                    offset = int(q.get("offset", ["-1"])[0])
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError as exc:
+                    raise TransferError("文件分块参数无效") from exc
+                return self._json(LOCAL_CACHE.append(q.get("id", [""])[0], offset, length, self.rfile))
+            d = self._body()
+            if action == "start":
+                name = Path(safe_rel(str(d.get("name") or "文件"))).name
+                return self._json(LOCAL_CACHE.start(name, d.get("size"), d.get("temporary") is True))
+            if action == "finish":
+                return self._json(LOCAL_CACHE.finish(d.get("id")))
+            if action == "discard":
+                LOCAL_CACHE.discard(d.get("id"))
+                return self._json({"ok": True})
+            raise TransferError("未知本机缓存操作", 404)
+        except TransferError as e:
+            self.close_connection = True
+            return self._json({"ok": False, "error": str(e)}, e.status)
+        except OSError as e:
+            self.close_connection = True
+            print("[local file cache]", e)
+            return self._json({"ok": False, "error": "写入本机缓存失败，请检查数据盘空间和权限。"}, 500)
+
+    def _api_legacy_forward(self, d):
+        """Legacy receiver protocol, without a cross-origin or whole-File request in WebView."""
+        pid = d.get("peerId")
+        with FILE_LOCK:
+            peer = dict(PEERS.get(pid, {})) if isinstance(pid, str) else {}
+        if not peer:
+            return self._json({"ok": False, "error": "会话设备已移除"}, 404)
+        try:
+            if d.get("stageId"):
+                stream, size = LOCAL_CACHE.open_temporary(d["stageId"])
+            else:
+                path = resolve_media_path(d.get("path"))
+                if not path or CACHE_DIR.resolve() not in path.parents or not path.is_file():
+                    raise TransferError("找不到本机文件缓存", 404)
+                stream = path.open("rb")
+                size = path.stat().st_size
+        except (TransferError, OSError) as e:
+            return self._json({"ok": False, "error": str(e)}, 400)
+
+        tid = str(d.get("id") or new_id("t-"))
+        extra = {key:d[key] for key in ("folder","idx","count","total","silent") if key in d}
+        query = urllib.parse.urlencode(dict(id=tid, msgId=str(d.get("msgId") or new_id("m-")),
+            name=str(d.get("name") or "文件"), rel=str(d.get("rel") or d.get("name") or "文件"),
+            size=size, kind="image" if d.get("kind") == "image" else "file",
+            time=d.get("time") or now_ms(), **{"from":ME["id"],"fromName":ME["name"]}, **extra))
+
+        class UploadStream:
+            offset = 0
+            last = time.monotonic()
+            previous = 0
+
+            def read(self, count):
+                data = stream.read(count)
+                self.offset += len(data)
+                now = time.monotonic()
+                if data and now - self.last >= 0.3:
+                    broadcast({"type":"forward-progress","id":tid,"bytes":self.offset,
+                               "speed":int((self.offset - self.previous)/(now - self.last))})
+                    self.previous, self.last = self.offset, now
+                return data
+
+        conn = http.client.HTTPConnection(peer["ip"], int(peer["http"]), timeout=45, blocksize=CHUNK)
+        try:
+            with stream:
+                try:
+                    conn.request("POST", "/api/file/upload?" + query, body=UploadStream(),
+                                 headers={"Content-Type":"application/octet-stream","Content-Length":str(size)})
+                except (BrokenPipeError, ConnectionResetError) as interrupted:
+                    # The receiver can send an error and close early, before all bytes are written.
+                    try:
+                        reply = conn.getresponse()
+                    except (OSError, http.client.HTTPException):
+                        raise interrupted
+                else:
+                    reply = conn.getresponse()
+                try:
+                    result = json.loads(reply.read(32768))
+                except ValueError:
+                    result = {}
+                if not isinstance(result, dict) or not 200 <= reply.status < 300 or not result.get("ok"):
+                    detail = result.get("error") if isinstance(result, dict) else None
+                    if detail and ("relative" in detail or "subpath" in detail):
+                        detail = "对方旧版无法写入自定义接收目录，请更新接收端或检查其接收设置。"
+                    return self._json({"ok": False, "error": detail or f"接收端拒收（HTTP {reply.status}）"}, 502)
+                return self._json({"ok": True, "path": result.get("path", "")})
+        except ConnectionRefusedError:
+            return self._json({"ok": False, "error": "对方的传输入口拒绝连接，请确认近传仍在运行。"}, 502)
+        except TimeoutError:
+            return self._json({"ok": False, "error": "发送文件超时，请检查双方连接和接收端磁盘。"}, 504)
+        except (OSError, http.client.HTTPException) as e:
+            print("[legacy file forward]", e)
+            return self._json({"ok": False, "error": "连接在发送数据时中断，诊断通过不代表文件已送达。"}, 502)
+        finally:
+            conn.close()
 
     def _api_cache(self, q):
         name = q.get("name", ["file"])[0]
@@ -2792,13 +2945,27 @@ class Handler(BaseHTTPRequestHandler):
         count = max(1, int(q.get("count", ["1"])[0] or 1))
         total = int(q.get("total", [str(size)])[0] or size)
         parts = rel.split("/")
+        if n != size or size < 0 or (folder_mode and (len(parts) < 2 or idx < 0 or idx >= count or total < size)):
+            self.close_connection = True
+            return self._json({"ok": False, "error": "文件大小或目录批次参数无效"}, 400)
 
         with FILE_LOCK:
             task = TRANSFERS.get(tid) if folder_mode else None
 
         if folder_mode and task is None:
+            if idx != 0:
+                self.close_connection = True
+                return self._json({"ok": False, "error": "找不到文件夹批次，请从头发送。"}, 409)
             # 文件夹批次：第一层目录名作为目标根目录（同名自动加序号）
-            root = unique_path(DOWNLOAD_DIR / parts[0])
+            try:
+                with FILE_LOCK:
+                    root = unique_path(DOWNLOAD_DIR / parts[0])
+                    root.mkdir(parents=True)
+                    ref = received_reference(root)
+            except OSError as e:
+                print("[receive folder]", e)
+                self.close_connection = True
+                return self._json({"ok": False, "error": "接收端无法创建目录，请检查保存位置和权限。"}, 500)
             task = {
                 "id": tid, "direction": "in", "peerId": from_id,
                 "name": parts[0], "rel": rel, "size": total, "kind": "folder",
@@ -2806,35 +2973,48 @@ class Handler(BaseHTTPRequestHandler):
                 "doneBytes": 0, "speed": 0, "status": "running",
                 "start": time.time(), "msgId": mid,
                 "rootDir": str(root),
-                "path": str(root.relative_to(DATA_DIR)).replace("\\", "/")
+                "path": ref
             }
             with FILE_LOCK:
                 TRANSFERS[tid] = task
             push_progress(task)
             target = root / Path(*parts[1:]) if len(parts) > 1 else root / parts[0]
         elif folder_mode:
+            if task.get("status") != "running" or task.get("filesDone") != idx or task.get("peerId") != from_id:
+                self.close_connection = True
+                return self._json({"ok": False, "error": "文件夹批次已中断，请重新发送。"}, 409)
             root = Path(task["rootDir"])
             target = root / Path(*parts[1:]) if len(parts) > 1 else root / parts[0]
         else:
-            target = unique_path(DOWNLOAD_DIR / rel)
+            try:
+                with FILE_LOCK:
+                    target = unique_path(DOWNLOAD_DIR / rel)
+                    ref = received_reference(target)
+            except OSError as e:
+                print("[receive file location]", e)
+                self.close_connection = True
+                return self._json({"ok": False, "error": "接收端存储路径不可用。"}, 500)
             task = {
                 "id": tid, "direction": "in", "peerId": from_id,
                 "name": name, "rel": rel, "size": size,
                 "doneBytes": 0, "speed": 0, "status": "running",
                 "start": time.time(), "msgId": mid,
-                "path": str(target.relative_to(DATA_DIR)).replace("\\", "/")
+                "path": ref
             }
             with FILE_LOCK:
                 TRANSFERS[tid] = task
             push_progress(task)
 
-        target.parent.mkdir(parents=True, exist_ok=True)
         remaining = n
         last = time.time()
         last_bytes = int(task.get("doneBytes", 0))
         err = None
+        created = False
         try:
-            with open(target, "wb") as out:
+            self.connection.settimeout(45)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("xb") as out:
+                created = True
                 while remaining > 0:
                     chunk = self.rfile.read(min(CHUNK, remaining))
                     if not chunk:
@@ -2852,6 +3032,12 @@ class Handler(BaseHTTPRequestHandler):
             err = str(e)
 
         if err:
+            self.close_connection = True
+            if created:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError as e:
+                    print("[cleanup incomplete upload]", e)
             task["status"] = "error"
             task["error"] = err
             push_progress(task)
