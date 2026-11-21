@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/kiu9676-cmd/JinChuang/archive/refs/heads/main.zip">下载源码</a> ·
+  <a href="docs/SHOWCASE.md">功能图览</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="docs/USAGE.md">使用手册</a> ·
   <a href="CHANGELOG.md">更新日志</a> ·
@@ -16,14 +17,22 @@
 
 ![近传会话界面：设备列表、文字和文件消息](docs/images/conversation.png)
 
-## 能做什么
+## 功能一览
 
-- **找到同一网络里的设备**：自动发现，或手动添加 IP。连不上时，可以在添加好友或好友资料里检测地址和端口。
-- **聊天和查附件**：支持单聊和群聊、截图、拖放文件和文件夹。按 `Ctrl+F`（macOS：`⌘F`）搜索当前会话，再按类型筛选和定位。
-- **大文件传到一半也能接着传**：双方使用 v1.6.1 或更新版本时，单聊的文件和图片支持暂停、继续、取消；按接收端确认的进度恢复，完成后校验 SHA-256。
-- **数据留在本机**：聊天记录、好友资料和接收文件默认保存在 `data/`，接收目录可自定义。
+<table>
+  <tr>
+    <td width="50%"><a href="docs/SHOWCASE.md#发送前检查附件"><img src="docs/images/attachment-draft.png" alt="待发送区展示三种附件"></a><br><b>发送前先检查附件</b><br>拖入或选择文件，确认后再发送。</td>
+    <td width="50%"><a href="docs/SHOWCASE.md#搜索会话和筛选文件"><img src="docs/images/conversation-search.png" alt="会话内搜索并筛选文件"></a><br><b>会话内快速找文件</b><br>按 Ctrl+F 搜索，筛选、定位或下载。</td>
+  </tr>
+  <tr>
+    <td width="50%"><a href="docs/SHOWCASE.md#添加好友和连接诊断"><img src="docs/images/connection-diagnostics.png" alt="添加好友时查看连接诊断结果"></a><br><b>连不上，先检测</b><br>核对地址、版本和响应时间。</td>
+    <td width="50%"><a href="docs/SHOWCASE.md#暂停继续和取消传输"><img src="docs/images/transfer.png" alt="文件传到 40% 后保留进度并暂停"></a><br><b>大文件可以暂停再继续</b><br>保留确认进度，传完用 SHA-256 校验。</td>
+  </tr>
+</table>
 
-[查看暂停传输界面](docs/images/transfer.png)。文件夹和群文件沿用原有传输方式，暂未加入断点续传。
+[查看完整功能图览：还有取消传输、头像设置、深色模式和四川麻将 →](docs/SHOWCASE.md)
+
+双方使用 v1.6.1 或更新版本时，单聊文件和图片支持暂停、继续、取消。群文件和整目录沿用原有传输方式。
 
 ## 快速开始
 
