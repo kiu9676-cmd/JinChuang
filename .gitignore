@@ -1,0 +1,30 @@
+# Runtime, local environments and builds
+/data/
+/dist/
+/build_tmp/
+/screenshots/
+/web/games/mj/
+.venv/
+venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+*.spec
+*.exe
+*.msi
+*.zip
+/近传
+
+# Private local configuration and editor files
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+.workbuddy/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

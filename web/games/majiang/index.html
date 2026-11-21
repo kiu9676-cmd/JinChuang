@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="version" content="1.0.0">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>四川麻将 · 血战到底</title>
+<script>if(new URLSearchParams(location.search).get('motion') === 'reduced') document.documentElement.dataset.motion = 'reduced';</script>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div id="viewport">
+  <div id="stage">
+    <div class="felt"></div>
+    <div class="felt-grain"></div>
+    <div class="felt-edge"></div>
+
+    <div id="center">
+      <div class="center-top">
+        <span class="chip"><span id="table-kind">房间</span> <b id="room-id">----</b></span>
+        <span class="chip" id="round-label">第 1 局</span>
+        <span class="chip" id="phase-label">准备中</span>
+        <span class="chip" id="seat-count">1/4</span>
+      </div>
+      <div class="wall-badge" title="牌墙剩余张数">
+        <span id="wall-num">0</span><small>余牌</small>
+      </div>
+      <div id="river">
+        <div class="river-side" data-pos="0"></div>
+        <div class="river-side" data-pos="1"></div>
+        <div class="river-side" data-pos="2"></div>
+        <div class="river-side" data-pos="3"></div>
+      </div>
+      <div id="center-hint"></div>
+    </div>
+
+    <div class="seat slot-bottom" data-pos="0"></div>
+    <div class="seat slot-right"  data-pos="1"></div>
+    <div class="seat slot-top"    data-pos="2"></div>
+    <div class="seat slot-left"   data-pos="3"></div>
+
+    <div id="turn-timer" class="hidden" title="托管倒计时">
+      <span id="timer-num">15</span>
+      <small>秒后托管</small>
+    </div>
+
+    <div id="actionbar"></div>
+
+    <div id="toolbar">
+      <button class="tool-btn" id="btn-mute" type="button" title="音效开关">音效 开</button>
+      <button class="tool-btn" id="btn-bgm" type="button" title="背景音乐开关">音乐 关</button>
+      <button class="tool-btn" id="btn-help" type="button" title="规则说明">规则</button>
+      <button class="tool-btn" id="btn-settings" type="button" title="设置">设置</button>
+      <button class="tool-btn danger" id="btn-leave" type="button" title="退出本桌">退出</button>
+    </div>
+
+    <div id="fx-layer"></div>
+    <div id="toast-layer"></div>
+    <div id="modal-layer"></div>
+    <div id="boot-layer"></div>
+  </div>
+</div>
+
+<script src="../../appearance.js"></script>
+<script src="assets/js/tiles.js"></script>
+<script src="assets/js/engine.js"></script>
+<script src="assets/js/ai.js"></script>
+<script src="assets/js/audio.js"></script>
+<script src="assets/js/net.js"></script>
+<script src="assets/js/ui.js"></script>
+<script src="assets/js/main.js"></script>
+<script>
+(function () {
+  // 主脚本未启动时的最后兜底：绝不白屏，也不用 alert/confirm。
+  setTimeout(function () {
+    if (window.__MJ_BOOTED__) return;
+    var layer = document.getElementById('boot-layer');
+    if (!layer) return;
+    layer.style.display = 'flex';
+    layer.innerHTML = '<div class="boot-card"><h2>游戏未能启动</h2>' +
+      '<p>静态资源加载失败。请确认 majiang 目录完整（assets/css/style.css 与 assets/js/*.js 均存在），然后重新打开 index.html。</p>' +
+      '<p class="boot-sub">版本 1.0.0 · 离线运行，不依赖网络</p></div>';
+  }, 1500);
+})();
+</script>
+</body>
+</html>

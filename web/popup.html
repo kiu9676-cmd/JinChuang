@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>近传消息</title>
+<link rel="stylesheet" href="/static/theme.css">
+<style>
+  *{box-sizing:border-box}
+  html,body{width:100%;height:100%;margin:0;overflow:hidden}
+  body{font:13px/1.4 "Segoe UI Variable Text","Segoe UI","PingFang SC","Microsoft YaHei UI",sans-serif;background:var(--wash);color:var(--ink)}
+  button{font:inherit;color:inherit;border:0;cursor:pointer}
+  button:focus-visible{outline:2px solid var(--brand);outline-offset:-3px}
+  .card{position:absolute;inset:3px;overflow:hidden;border-radius:14px;border:1px solid var(--glass-edge);background:var(--glass-front);backdrop-filter:blur(14px);box-shadow:var(--shadow-2)}
+  .card.entering{animation:notification-in var(--d3) var(--ease-out)}
+  @keyframes notification-in{from{opacity:.5;transform:translateY(5px)}to{opacity:1;transform:none}}
+  .open{width:100%;height:100%;display:flex;align-items:center;gap:11px;text-align:left;background:transparent;padding:9px 37px 9px 12px;transition:background var(--d2) var(--ease)}
+  .open:hover{background:var(--card-hover)}
+  .avatar{width:39px;height:39px;border-radius:12px;flex:none;display:grid;place-items:center;font-size:15px;font-weight:700;color:#fff;background:#4948a8}
+  .avatar img{width:100%;height:100%;border-radius:inherit;object-fit:contain}
+  .txt{flex:1;min-width:0}
+  .eyebrow{display:flex;align-items:center;gap:4px;color:var(--brand);font-weight:700;font-size:10px;letter-spacing:.06em}
+  .eyebrow img{width:12px;height:12px}
+  .sender{display:flex;align-items:center;gap:6px;margin-top:2px}
+  .name,.msg{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .name{font-weight:700}
+  .msg{display:block;font-size:12px;color:var(--ink-3);margin-top:2px}
+  .badge{background:var(--brand-soft);color:var(--brand);padding:1px 5px;border-radius:999px;font-size:10px;font-weight:700;flex:none}
+  .badge.hidden{display:none}
+  .close{position:absolute;right:8px;top:8px;background:var(--canvas);color:var(--ink-3);border-radius:7px;width:25px;height:25px;font-size:17px;padding:0}
+  .close:hover{background:var(--brand-soft);color:var(--brand)}
+  [data-motion="reduced"] .card{animation:none}
+  @media(prefers-reduced-motion:reduce){.card{animation:none}.open{transition:none}}
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <button class="open" id="open" type="button" title="打开会话">
+    <span class="avatar" id="avatar" aria-hidden="true">近</span>
+    <span class="txt">
+      <span class="eyebrow"><img src="/static/logo.png" alt="">近传 · 消息通知</span>
+      <span class="sender"><span class="name" id="name">近传</span><span class="badge hidden" id="badge">0</span></span>
+      <span class="msg" id="msg">打开查看会话</span>
+    </span>
+  </button>
+  <button class="close" id="close" type="button" aria-label="关闭消息通知">×</button>
+</div>
+<script src="/static/appearance.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const api = (p, b) => fetch(p, { method:'POST', headers:{'Content-Type':'application/json'},
+  body: JSON.stringify(b || {}) }).catch(() => null);
+let peerId = '';
+let lastId = '';
+const preference = matchMedia('(prefers-color-scheme: dark)');
+let theme = 'auto';
+function syncTheme(){
+  document.documentElement.dataset.theme = theme === 'dark' || (theme === 'auto' && preference.matches) ? 'dark' : 'light';
+}
+try{
+  theme = localStorage.getItem('lb.theme') || 'auto';
+  document.documentElement.dataset.motion = localStorage.getItem('lb.motion') || 'full';
+}catch(e){}
+syncTheme();
+preference.addEventListener('change', syncTheme);
+$('card').addEventListener('animationend', () => $('card').classList.remove('entering'));
+
+
+function preview(m){
+  if(!m) return '新消息';
+  if(m.type === 'image') return '[图片]';
+  if(m.type === 'file') return '[文件] ' + (m.fileName || '');
+  if(m.type === 'folder') return '[文件夹] ' + (m.fileName || '');
+  if(m.type === 'recalled') return '撤回了一条消息';
+  return m.text || '新消息';
+}
+
+async function refresh(){
+  try{
+    const s = await fetch('/api/state').then(r => r.json());
+    if(!s || !s.ok) return;
+    theme = s.config.theme || 'auto';
+    syncTheme();
+    document.documentElement.dataset.motion = s.config.motion || 'full';
+    const total = Object.values(s.unread || {}).reduce((a,b) => a+b, 0);
+    $('badge').textContent = total > 99 ? '99+' : total;
+    $('badge').classList.toggle('hidden', !total);
+    let last = null, pid = '';
+    for(const [k, arr] of Object.entries(s.messages || {})){
+      const m = arr.findLast(item => item.dir === 'in' && item.type !== 'recalled');
+      if(!m) continue;
+      const unread = !!s.unread[k], lastUnread = !!s.unread[pid];
+      if(!last || (unread && !lastUnread) || (unread === lastUnread && (m.time || 0) > (last.time || 0))){
+        last = m; pid = k;
+      }
+    }
+    if(!last) return;
+    peerId = pid;
+    if(lastId !== last.msgId){
+      lastId = last.msgId;
+      $('card').classList.add('entering');
+    }
+    const peer = s.peers.find(p => p.id === peerId);
+    const group = (s.groups || []).find(g => g.id === peerId);
+    const author = group ? s.peers.find(p => p.id === last.from) : peer;
+    const name = author?.displayName || author?.name || last.fromName || '好友';
+    $('name').textContent = group ? group.name : name;
+    $('msg').textContent = (group ? name + '：' : '') + preview(last);
+    syncAvatar($('avatar'), author?.avatarKey || last.fromAvatarKey);
+  }catch(e){}
+}
+refresh(); setInterval(refresh, 2500);
+
+$('open').onclick = () => api('/api/desktop', { action:'show', value: peerId });
+$('close').onclick = () => api('/api/desktop', { action:'popup_hide' });
+</script>
+</body>
+</html>
