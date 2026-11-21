@@ -144,7 +144,7 @@
           <textarea id="input" aria-label="消息内容" rows="1" placeholder="输入消息，Enter 发送 · Shift+Enter 换行"></textarea>
           <div class="composer-foot">
             <div class="tools">
-              <button class="tool" id="btnImage" title="添加图片" aria-label="添加图片">
+              <button class="tool" id="btnImage" title="添加图片（也可 Ctrl+V 粘贴）" aria-label="添加图片">
                 <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9" r="1.5"/><path d="M21 16l-5-5-5 5-2-2-6 6"/></svg>
               </button>
               <button class="tool" id="btnFile" title="添加文件" aria-label="添加文件">
@@ -278,6 +278,7 @@
 <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
 
 <script src="/static/appearance.js"></script>
+<script src="/static/clipboard.js"></script>
 <script src="/static/app.js"></script>
 <script src="/static/chat-tools.js"></script>
 <script src="/static/game.js"></script>

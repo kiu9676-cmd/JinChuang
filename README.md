@@ -5,7 +5,8 @@
 <p align="center">在同一个局域网里，直接聊天、发图、传文件。</p>
 
 <p align="center">
-  <a href="https://github.com/kiu9676-cmd/JinChuang/archive/refs/heads/main.zip">下载源码</a> ·
+  <a href="https://github.com/kiu9676-cmd/JinChuang/releases/latest/download/default.exe">下载 Windows 版</a> ·
+  <a href="https://github.com/kiu9676-cmd/JinChuang/archive/refs/tags/v1.6.2.zip">下载 v1.6.2 源码</a> ·
   <a href="docs/SHOWCASE.md">功能图览</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="docs/USAGE.md">使用手册</a> ·
@@ -21,11 +22,11 @@
 
 <table>
   <tr>
-    <td width="50%"><a href="docs/SHOWCASE.md#发送前检查附件"><img src="docs/images/attachment-draft.png" alt="待发送区展示三种附件"></a><br><b>发送前先检查附件</b><br>拖入或选择文件，确认后再发送。</td>
+    <td width="50%"><a href="docs/SHOWCASE.md#发送前检查附件"><img src="docs/images/attachment-draft.png" alt="待发送区展示粘贴的截图和文件"></a><br><b>发送前先检查附件</b><br>支持粘贴截图或拖入文件，确认后再发送。</td>
     <td width="50%"><a href="docs/SHOWCASE.md#搜索会话和筛选文件"><img src="docs/images/conversation-search.png" alt="会话内搜索并筛选文件"></a><br><b>会话内快速找文件</b><br>按 Ctrl+F 搜索，筛选、定位或下载。</td>
   </tr>
   <tr>
-    <td width="50%"><a href="docs/SHOWCASE.md#添加好友和连接诊断"><img src="docs/images/connection-diagnostics.png" alt="添加好友时查看连接诊断结果"></a><br><b>连不上，先检测</b><br>核对地址、版本和响应时间。</td>
+    <td width="50%"><a href="docs/SHOWCASE.md#添加好友和连接诊断"><img src="docs/images/connection-diagnostics.png" alt="好友资料中查看连接诊断结果"></a><br><b>连不上，先检测</b><br>核对地址、版本和响应时间。</td>
     <td width="50%"><a href="docs/SHOWCASE.md#暂停继续和取消传输"><img src="docs/images/transfer.png" alt="文件传到 40% 后保留进度并暂停"></a><br><b>大文件可以暂停再继续</b><br>保留确认进度，传完用 SHA-256 校验。</td>
   </tr>
 </table>
@@ -36,7 +37,9 @@
 
 ## 快速开始
 
-推荐使用 **Python 3.12**。在两台设备上各运行一份：
+**Windows 便携版**：从 [GitHub Release](https://github.com/kiu9676-cmd/JinChuang/releases/tag/v1.6.2) 下载 `default.exe`。从旧版升级时先退出托盘里的旧程序，新版放在原目录运行即可继续使用原有 `data/`。也可在旧版里通过「设置 → 更新」升级。
+
+**从源码运行**：推荐使用 **Python 3.12**。在两台设备上各运行一份：
 
 ```bash
 git clone https://github.com/kiu9676-cmd/JinChuang.git

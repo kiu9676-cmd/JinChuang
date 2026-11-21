@@ -44,8 +44,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_NAME = "近传"
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 BUILD_DATE = "2026-11-21"
+WINDOWS_RELEASE_ASSET = "default.exe"
 # 更新源：写死在这里（客户端界面不暴露、不可改）。
 # 仓库：https://github.com/kiu9676-cmd/JinChuang
 DEFAULT_UPDATE_REPO = "kiu9676-cmd/JinChuang"
@@ -454,12 +455,12 @@ def fallback_release_info(repo):
     if not tag:
         return None
     asset_url = "https://github.com/{}/releases/download/{}/{}".format(
-        repo, tag, urllib.parse.quote("近传.exe"))
+        repo, tag, urllib.parse.quote(WINDOWS_RELEASE_ASSET))
     return {
         "ok": True, "repo": repo, "tag": tag, "latest": tag.lstrip("vV"),
         "notes": "", "publishedAt": "", "fallback": True,
         "htmlUrl": "https://github.com/{}/releases/tag/{}".format(repo, tag),
-        "asset": {"name": "近传.exe", "size": 0, "url": asset_url},
+        "asset": {"name": WINDOWS_RELEASE_ASSET, "size": 0, "url": asset_url},
         "current": VERSION,
         "hasUpdate": parse_version(tag) > parse_version(VERSION),
     }

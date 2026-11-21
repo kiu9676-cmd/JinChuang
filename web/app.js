@@ -2357,6 +2357,21 @@ $('fileInput').onchange = e => { queueItems(filesToItems(e.target.files, false))
 $('imageInput').onchange = e => { queueItems(filesToItems(e.target.files, false)); e.target.value=''; };
 $('folderInput').onchange = e => { queueItems(filesToItems(e.target.files, true)); e.target.value=''; };
 
+document.addEventListener('paste', e => {
+  if(e.defaultPrevented || !current || surface !== 'chats' || !convOf(current)) return;
+  const target = e.target;
+  const input = $('input');
+  if(!$('chatPane').contains(target) && target !== document.body && target !== document.documentElement) return;
+  if(target !== input && target.closest?.('input, textarea, select, [contenteditable]')) return;
+  if(['modalMask','lightbox','chatSearchPanel','gameMask','mjFrameMask'].some(id =>
+       !$(id).classList.contains('hidden'))) return;
+  const pictures = collectClipboardImages(e.clipboardData);
+  if(!pictures.length) return;
+  e.preventDefault();
+  queueItems(pictures);
+  input.focus({preventScroll:true});
+});
+
 const chatRoot = $('chatRoot');
 let dragDepth = 0;
 chatRoot.addEventListener('dragenter', e => { e.preventDefault(); dragDepth++; if(current && surface === 'chats') $('dropMask').classList.remove('hidden'); });

@@ -11,7 +11,7 @@
 ```bash
 python server.py --no-browser --data-dir ./data/dev
 python -m unittest discover -s tests
-node --test tests/mahjong-engine.test.cjs
+node --test tests/mahjong-engine.test.cjs tests/clipboard.test.cjs
 ```
 
 两个本地实例要分别指定不同的 HTTP 端口、UDP 端口和数据目录。请使用模拟设备名和测试文件。涉及传输的 PR，请说明是否覆盖失败重试、两端重启、旧版互通、文件校验或取消清理；涉及界面的 PR 欢迎附演示截图。
@@ -32,7 +32,7 @@ node --test tests/mahjong-engine.test.cjs
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
-.\.venv\Scripts\python.exe release.py --build-only --no-git --no-zip --version 1.6.1
+.\.venv\Scripts\python.exe release.py --build-only --no-git --no-zip --version 1.6.2
 ```
 
 产物为 `dist/近传.exe`，也可用 `build.bat` 打包。若要发布新版本，核对 `server.py` 中的版本号、`CHANGELOG.md` 和附件哈希；在 GitHub Release 用 `vX.Y.Z` 作为标签，附上已验证的 `.exe`。派生项目应按需设置自己的更新源。
