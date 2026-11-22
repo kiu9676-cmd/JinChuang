@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import server
 from local_cache import LocalCache
-from transfer_resume import MAX_CHUNK
+from transfer_resume import MAX_CHUNK, NETWORK_CHUNK
 
 
 class LocalTransferTests(unittest.TestCase):
@@ -58,10 +58,10 @@ class LocalTransferTests(unittest.TestCase):
     def stage(self, name, data, temporary=False):
         code, start = self.request("/api/cache/start",dict(name=name,size=len(data),temporary=temporary))
         self.assertEqual(code,200)
-        self.assertEqual(start["chunkSize"],MAX_CHUNK)
+        self.assertEqual(start["chunkSize"],NETWORK_CHUNK)
         tid = start["id"]
-        for offset in range(0,len(data),MAX_CHUNK):
-            end = min(offset+MAX_CHUNK,len(data))
+        for offset in range(0,len(data),start["chunkSize"]):
+            end = min(offset+start["chunkSize"],len(data))
             code, body = self.request("/api/cache/append?"+urlencode(dict(id=tid,offset=offset)),data[offset:end],True)
             self.assertEqual((code,body),(200,{"ok":True,"offset":end}))
         code, result = self.request("/api/cache/finish",{"id":tid})

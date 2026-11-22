@@ -4,6 +4,8 @@ import json
 import os
 import re
 import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 
 MAX_CHUNK = 4 * 1024 * 1024  # browser intake + old peers
@@ -26,6 +28,11 @@ def digest_file(path):
         for block in iter(lambda: source.read(MAX_CHUNK), b""):
             result.update(block)
     return result.hexdigest()
+
+
+def file_stamp(path):
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
 def write_record(path, record):
@@ -52,6 +59,8 @@ class ChunkStore:
         self.available_name = available_name
         self.locks = [threading.RLock() for _ in range(32)]
         self.commit_lock = threading.Lock()
+        self.digest_lock = threading.Lock()
+        self.stream_digests = OrderedDict()
 
     @staticmethod
     def key(source, tid):
@@ -87,10 +96,13 @@ class ChunkStore:
                     path=("received/" + key + "/" + Path(record["target"]).name) if record.get("complete") else "",
                     approval=record.get("approval", ""))
 
-    def status(self, meta, observe=None):
+    def status(self, meta, observe=None, *, prepare=False):
         key = self.key(meta.get("from"), meta.get("id"))
         size, checksum = meta.get("size"), meta.get("sha256")
-        if type(size) is not int or not 0 <= size < 2**53 or not isinstance(checksum, str) or not DIGEST.fullmatch(checksum):
+        valid_size = type(size) is int and 0 <= size < 2**53
+        valid_hash = (meta.get("sendMode") == "online" and checksum is None) if prepare else (
+            isinstance(checksum, str) and DIGEST.fullmatch(checksum))
+        if not valid_size or not valid_hash:
             raise TransferError("文件大小或校验值无效")
         with self._lock(key):
             record = read_record(self._path(key))
@@ -104,11 +116,17 @@ class ChunkStore:
             elif record.get("canceled"):
                 raise TransferError("这项传输已取消", 410)
             elif (record.get("sendMode", "direct") != meta.get("sendMode", "direct")
-                  or any(record[k] != meta[k] for k in ("name", "size", "sha256", "msgId"))):
+                  or any(record[k] != meta[k] for k in ("name", "size", "msgId"))
+                  or not prepare and record.get("sha256") not in (None, checksum)):
                 raise TransferError("这项任务的原文件已变化，需重新发送", 409)
+            if not prepare and record.get("sha256") is None:
+                record["sha256"] = checksum
+                write_record(self._path(key), record)
             if record.get("approval") == "pending":
                 if observe and fresh:
                     observe(record, 0, "offered")
+                return self._view(record, key)
+            if prepare:
                 return self._view(record, key)
             if record.get("paused"):
                 record["paused"] = False
@@ -140,26 +158,22 @@ class ChunkStore:
             record["approval"] = "accepted"
             write_record(self._path(key), record)
             if observe:
-                observe(record, 0, "waiting")
+                observe(record, 0, "waiting" if record.get("sha256") else "waiting_source")
             return self._view(record, key)
 
     def stream(self, source, tid, offset, length, reader, observe=None):
         """Receive one HTTP body, with durable boundaries while it is still arriving."""
-        key = self.key(source, tid)
-        with self._lock(key):
-            record = self._record(key)
-            if record.get("canceled"):
-                raise TransferError("这项传输已取消", 410)
-            if record.get("approval") == "pending":
-                raise TransferError("接收端还没有确认接收", 409)
-            if length <= 0 or offset != self._offset(record) or offset + length > record["size"]:
-                raise TransferError("流式传输范围无效", 409, offset=self._offset(record))
-            while length:
-                count = min(length, NETWORK_CHUNK)
-                self.append(source, tid, offset, count, reader, observe)
-                offset += count
-                length -= count
-            return {"ok": True, "offset": offset}
+        return self._receive(source, tid, offset, length, reader, observe, continuous=True)[0]
+
+    def _take_digest(self, key):
+        with self.digest_lock:
+            return self.stream_digests.pop(key, None)
+
+    def _remember_digest(self, key, stamp, sha):
+        with self.digest_lock:
+            self.stream_digests[key] = (stamp, sha)
+            if len(self.stream_digests) > 64:
+                self.stream_digests.popitem(last=False)
 
     def control(self, source, tid, action, publish, observe=None):
         key = self.key(source, tid)
@@ -185,6 +199,7 @@ class ChunkStore:
                 return dict(ok=True, offset=offset, paused=True, complete=False)
             if action != "cancel":
                 raise TransferError("未知传输操作")
+            self._take_digest(key)
             # Mark cancellation before deletion so a late append/status can never recreate it.
             tombstone = dict(record or {"from":source, "id":tid}, canceled=True)
             write_record(self._path(key), tombstone)
@@ -204,8 +219,11 @@ class ChunkStore:
                     yield record, offset
 
     def append(self, source, tid, offset, length, reader, observe=None):
+        return self._receive(source, tid, offset, length, reader, observe, continuous=False)
+
+    def _receive(self, source, tid, offset, length, reader, observe, *, continuous):
         key = self.key(source, tid)
-        if not 0 < length <= NETWORK_CHUNK:
+        if length <= 0 or not continuous and length > NETWORK_CHUNK:
             raise TransferError("文件分块长度无效")
         with self._lock(key):
             record = self._record(key)
@@ -214,34 +232,55 @@ class ChunkStore:
             previous = self._offset(record)
             if record.get("approval") == "pending":
                 raise TransferError("接收端还没有确认接收", 409)
+            if record.get("sha256") is None:
+                raise TransferError("发送方尚未准备好文件", 409, offset=previous)
             if record.get("paused"):
                 raise TransferError("这项传输已暂停，请先继续", 409, offset=previous)
             if record.get("complete") or offset != previous or offset + length > record["size"]:
                 raise TransferError("接收端进度已变化", 409, offset=previous)
+            self._take_digest(key)
             part = Path(record["part"])
             part.parent.mkdir(parents=True, exist_ok=True)
-            with part.open("ab") as out:
+            if not part.exists():
+                part.touch()
+            end, committed = offset + length, offset
+            # A cold resume must not postpone socket reads to rehash a huge existing prefix.
+            # In that case, finish verifies the on-disk file instead.
+            sha = hashlib.sha256() if continuous and offset == 0 else None
+            with part.open("r+b") as out:
                 try:
                     out.truncate(previous)
-                    remaining = length
-                    while remaining:
-                        block = reader.read(min(BUFFER, remaining))
-                        if not block:
-                            raise TransferError("连接中断，未确认的分块未写入", 409, offset=previous)
-                        out.write(block)
-                        remaining -= len(block)
-                    out.flush()
-                    os.fsync(out.fileno())
-                    record["offset"] = previous + length
-                    write_record(self._path(key), record)
-                except (OSError, TransferError):
-                    out.truncate(previous)
+                    out.seek(previous)
+                    tick = time.monotonic()
+                    while offset < end:
+                        boundary = min(end, offset + NETWORK_CHUNK)
+                        while offset < boundary:
+                            block = reader.read(min(BUFFER, boundary - offset))
+                            if not block:
+                                raise TransferError("连接中断，未确认的分块未写入", 409, offset=committed)
+                            out.write(block)
+                            if sha is not None:
+                                sha.update(block)
+                            offset += len(block)
+                            now = time.monotonic()
+                            if observe and now - tick >= .25:
+                                observe(record, committed, wire=offset)
+                                tick = now
+                        out.flush()
+                        os.fsync(out.fileno())
+                        record["offset"] = boundary
+                        write_record(self._path(key), record)
+                        committed = boundary
                     if observe:
-                        observe(record, previous, "waiting", error="接收中断，等待对方继续。")
+                        observe(record, committed, wire=committed)
+                except (OSError, TransferError):
+                    out.truncate(committed)
+                    if observe:
+                        observe(record, committed, "waiting", error="接收中断，等待对方继续。")
                     raise
-            if observe:
-                observe(record, previous + length)
-            return dict(ok=True, offset=previous + length), record
+            if sha is not None and committed == record["size"]:
+                self._remember_digest(key, file_stamp(part), sha.hexdigest())
+            return dict(ok=True, offset=committed), record
 
     def finish(self, source, tid, publish, observe=None):
         key = self.key(source, tid)
@@ -252,6 +291,8 @@ class ChunkStore:
             if not record.get("complete"):
                 if record.get("approval") == "pending":
                     raise TransferError("接收端还没有确认接收", 409)
+                if record.get("sha256") is None:
+                    raise TransferError("发送方尚未准备好文件", 409)
                 if record.get("paused"):
                     raise TransferError("这项传输已暂停，请先继续", 409, offset=self._offset(record))
                 part = Path(record["part"])
@@ -260,31 +301,32 @@ class ChunkStore:
                     part.touch(exist_ok=True)
                 if self._offset(record) != record["size"]:
                     raise TransferError("文件还没收齐", 409, offset=self._offset(record))
-                if part.is_file():
+                target = Path(record["target"]) if record.get("target") else None
+                verifying = part if part.exists() else target
+                if verifying is None or not verifying.is_file():
+                    raise TransferError("接收端缺少临时文件", 409)
+                if part.is_file() and part.stat().st_size != record["size"]:
                     with part.open("r+b") as stream:
                         stream.truncate(record["size"])
-                with self.commit_lock:
-                    target = Path(record["target"]) if record.get("target") else None
-                    verifying = part if part.exists() else target
-                    if verifying is None or not verifying.is_file():
-                        raise TransferError("接收端缺少临时文件", 409)
+                if observe:
+                    observe(record, record["size"], "verifying")
+                try:
+                    cached = self._take_digest(key)
+                    checksum = cached[1] if cached and cached[0] == file_stamp(verifying) else digest_file(verifying)
+                except OSError:
                     if observe:
-                        observe(record, record["size"], "verifying")
-                    try:
-                        checksum = digest_file(verifying)
-                    except OSError:
-                        if observe:
-                            observe(record, record["size"], "waiting", error="读取文件失败，等待对方重试。")
-                        raise
-                    if checksum != record["sha256"]:
-                        if verifying == part:
-                            part.unlink()
-                        record.pop("target", None)
-                        record["offset"] = 0
-                        write_record(self._path(key), record)
-                        if observe:
-                            observe(record, 0, "waiting", error="文件校验失败，等待对方重试。")
-                        raise TransferError("SHA-256 校验未通过，已清除坏数据；重试将从头发送", 422, offset=0)
+                        observe(record, record["size"], "waiting", error="读取文件失败，等待对方重试。")
+                    raise
+                if checksum != record["sha256"]:
+                    if verifying == part:
+                        part.unlink()
+                    record.pop("target", None)
+                    record["offset"] = 0
+                    write_record(self._path(key), record)
+                    if observe:
+                        observe(record, 0, "waiting", error="文件校验失败，等待对方重试。")
+                    raise TransferError("SHA-256 校验未通过，已清除坏数据；重试将从头发送", 422, offset=0)
+                with self.commit_lock:
                     if part.exists():
                         if target is None or target.exists():
                             preferred = record.get("destinationChoice")

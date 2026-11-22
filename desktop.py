@@ -212,6 +212,10 @@ class DesktopBridge(object):
         if main_hidden or not self.focused:
             self.show_popup(name, msg_preview(msg))
 
+    def on_file_offer(self, peer, name):
+        if not (server.CONFIG.get("dnd") or peer.get("mute")) and (not self.main_visible or not self.focused):
+            self.notify(peer.get("alias") or peer.get("name") or "好友", "有文件待接收：" + name)
+
     def on_unread(self):
         self._update_tray(sum(server.UNREAD.values()))
 

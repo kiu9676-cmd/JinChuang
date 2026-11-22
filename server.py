@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_NAME = "近传"
-VERSION = "1.6.5"
+VERSION = "1.6.6"
 BUILD_DATE = "2026-11-22"
 WINDOWS_RELEASE_ASSET = "default.exe"
 # 更新源：写死在这里（客户端界面不暴露、不可改）。
@@ -91,6 +91,7 @@ RESUME_STORE = None
 LOCAL_CACHE = None
 OUTBOX = {}
 OUTBOX_ACTIVE = set()
+TRANSFER_SEQUENCE = 0
 OUTBOX_LOCK = threading.RLock()
 OUTBOX_SLOTS = threading.BoundedSemaphore(2)
 DESKTOP = None    # 桌面外壳桥（desktop.py 注入：托盘/消息弹窗/原生对话框/截屏/通知）
@@ -272,7 +273,7 @@ def init_store(args):
         "udp": int(CONFIG["udp_port"]),
         "platform": platform.system(),
         "app": APP_NAME,
-        "v": VERSION, "resume": True, "transferControl": True, "resumeMaxChunk": NETWORK_CHUNK, "resumeStream": True, "receiveModes": True
+        "v": VERSION, "resume": True, "transferControl": True, "resumeMaxChunk": NETWORK_CHUNK, "resumeStream": True, "receiveModes": True, "prepareOffer": True
     }
 
 
@@ -458,12 +459,34 @@ def fallback_release_info(repo):
         repo, tag, urllib.parse.quote(WINDOWS_RELEASE_ASSET))
     return {
         "ok": True, "repo": repo, "tag": tag, "latest": tag.lstrip("vV"),
-        "notes": "", "publishedAt": "", "fallback": True,
+        "changes": [], "publishedAt": "", "fallback": True,
         "htmlUrl": "https://github.com/{}/releases/tag/{}".format(repo, tag),
         "asset": {"name": WINDOWS_RELEASE_ASSET, "size": 0, "url": asset_url},
         "current": VERSION,
         "hasUpdate": parse_version(tag) > parse_version(VERSION),
     }
+
+
+def release_changes(body):
+    """Take the release's change bullets, excluding packaging and upgrade metadata."""
+    changes = []
+    fenced = False
+    for line in (body or "")[:8000].splitlines():
+        line = line.strip()
+        if line.startswith(("```", "~~~")):
+            fenced = not fenced
+        if fenced:
+            continue
+        bullet = re.match(r"^[-*+]\s+(.+)$|^\d+[.)]\s+(.+)$", line)
+        if not bullet:
+            continue
+        value = next(x for x in bullet.groups() if x is not None)
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value).replace("`", "").replace("**", "").strip()
+        if re.match(r"^(?:升级(?:方式|说明)?|安装(?:方式|说明)?|(?:Windows\s*)?附件|SHA[- ]?256|校验值|对应源码|功能图览|依赖许可)(?:\s|[:：]|$)", text, re.I):
+            continue
+        if text and text not in changes:
+            changes.append(text)
+    return changes[:20]
 
 
 def fetch_latest_release():
@@ -509,7 +532,7 @@ def fetch_latest_release():
             break
     return {
         "ok": True, "repo": repo, "tag": tag, "latest": latest,
-        "notes": str(data.get("body") or "")[:8000],
+        "changes": release_changes(str(data.get("body") or "")),
         "publishedAt": data.get("published_at") or "",
         "htmlUrl": data.get("html_url") or "",
         "asset": asset,
@@ -693,7 +716,12 @@ def broadcast(obj):
 
 
 def push_progress(task):
-    broadcast({"type": "progress", "task": dict(task)})
+    global TRANSFER_SEQUENCE
+    with FILE_LOCK:
+        TRANSFER_SEQUENCE += 1
+        task["revision"] = TRANSFER_SEQUENCE
+        view = dict(task)
+    broadcast({"type": "progress", "task": view})
 
 
 def peer_view(p):
@@ -751,6 +779,7 @@ def new_peer(pid, info, ip, manual=False):
         "resume": info.get("resume") is True,
         "transferControl": info.get("transferControl") is True,
         "receiveModes": info.get("receiveModes") is True,
+        "prepareOffer": info.get("prepareOffer") is True,
         "group": "",                       # 分组（可编辑）
         "note": "",                        # 备注（可编辑）
         "pinned": False,
@@ -792,11 +821,17 @@ def update_peer(info, source_ip, manual=False):
         if p.get("receiveModes", False) != modes:
             p["receiveModes"] = modes
             changed = True
+        early_offer = info.get("prepareOffer") is True
+        if p.get("prepareOffer", False) != early_offer:
+            p["prepareOffer"] = early_offer
+            changed = True
         was_online = time.time() - p.get("last_seen", 0) < PEER_TIMEOUT
         p["last_seen"] = time.time()
-        if manual:
+        if manual and not p.get("manual"):
             p["manual"] = True
-        save_peers()
+            changed = True
+        if changed:
+            save_peers()
     if changed or not was_online:
         refresh()
     return PEERS.get(pid)
@@ -815,7 +850,8 @@ def expire_peers():
         now = time.monotonic()
         for task in TRANSFERS.values():
             if task.get("direction") == "in" and task.get("status") == "running" and now - task.get("lastActivity", now) > 30:
-                task.update(status="waiting", speed=0, error="暂未收到下一段数据，等待对方继续。")
+                task.update(status="waiting", speed=0, wireBytes=0, error="暂未收到下一段数据，等待对方继续。")
+                push_progress(task)
                 changed = True
     if changed:
         refresh()
@@ -931,7 +967,7 @@ SENDABLE = ("running", "queued", "waiting_accept")
 
 
 TASK_FIELDS = ("id", "peerId", "direction", "kind", "name", "size", "doneBytes",
-               "sendMode", "wireBytes", "speed", "status", "path", "msgId", "start", "time", "retryable", "control", "error")
+               "sendMode", "offerConfirmed", "wireBytes", "speed", "status", "path", "msgId", "start", "time", "retryable", "control", "error")
 
 
 def outbox_record(tid):
@@ -974,8 +1010,9 @@ def load_outbox():
                 task.update(status="error", speed=0, error="上次传输中断，点击重试可接着传。")
         elif state == "pausing":
             task.update(status="paused", speed=0, error="本机已暂停，接收端未确认。继续时会重新核对进度。")
-        elif state == "canceling":
-            task.update(status="cancel_wait", speed=0, error="上次清理尚未确认，请重试清理。")
+        elif state in ("canceling", "preparing"):
+            task.update(status="cancel_wait", speed=0, error="上次任务未完成，请清理对方的接收邀请后重新选择文件。"
+                        if state == "preparing" else "上次清理尚未确认，请重试清理。")
         if state != task.get("status"):
             write_record(path, task)
         OUTBOX[task["id"]] = task
@@ -983,7 +1020,7 @@ def load_outbox():
             TRANSFERS[task["id"]] = outbox_view(task)
 
 
-def start_outbox(d):
+def new_file_task(d, status):
     pid = d.get("peerId")
     with FILE_LOCK:
         peer = dict(PEERS.get(pid, {})) if isinstance(pid, str) else {}
@@ -994,19 +1031,65 @@ def start_outbox(d):
         raise TransferError("未知发送方式")
     if mode != "direct" and peer.get("receiveModes") is not True:
         raise TransferError("指定发送方式需要对方升级近传。", 409)
-    ref, size, checksum = d.get("path"), d.get("size"), d.get("sha256")
+    size = d.get("size")
+    if type(size) is not int or not 0 <= size < 2**53:
+        raise TransferError("文件大小无效")
     name = Path(safe_rel(str(d.get("name") or "文件"))).name
-    task = dict(id=new_id("t-"), msgId=new_id("m-"), peerId=pid, name=name, path=ref,
-                time=now_ms(), start=time.time(), size=size, doneBytes=0, speed=0, status="queued" if mode == "offline" else "running",
+    task = dict(id=new_id("t-"), msgId=new_id("m-"), peerId=pid, name=name, path="",
+                time=now_ms(), start=time.time(), size=size, doneBytes=0, speed=0, status=status,
                 sendMode=mode, direction="out", retryable=True, kind="image" if d.get("kind") == "image" else "file",
-                control=peer.get("transferControl") is True, remoteStarted=False,
-                sha256=checksum, reply=d.get("reply") if isinstance(d.get("reply"), dict) else None)
+                control=peer.get("transferControl") is True, remoteStarted=False, sha256=None,
+                reply=d.get("reply") if isinstance(d.get("reply"), dict) else None)
+    return task, peer
+
+
+def outbox_meta(task):
+    meta = {k: task[k] for k in ("id", "msgId", "kind", "name", "size", "sha256", "reply", "time")}
+    return dict(meta, **{"from": ME["id"], "sendMode": task.get("sendMode", "direct")})
+
+
+def prepare_outbox(d):
+    task, _ = new_file_task(d, "preparing")
+    if task["sendMode"] != "online":
+        raise TransferError("只有在线发送需要先通知对方", 409)
+    peer, can_control = outbox_peer(task)
+    if not peer["prepareOffer"] or not can_control:
+        raise TransferError("对方暂不支持提前通知，请更新对方的近传。", 409)
     with OUTBOX_LOCK:
+        update_outbox(task, remoteStarted=True, control=True)
+        OUTBOX[task["id"]] = task
+    try:
+        state = resume_response(*post_to(peer, "/api/file/resume/prepare", outbox_meta(task)),
+                                "对方没有收到接收邀请")
+        if state.get("approval") not in ("pending", "accepted") or confirmed_offset(task, state) != 0:
+            raise TransferError("对方没有确认接收邀请状态", 409)
+    except (TransferError, OSError, http.client.HTTPException):
+        control_outbox(task["id"], "cancel")
+        raise
+    with OUTBOX_LOCK:
+        return update_outbox(task, offerConfirmed=True)
+
+
+def start_outbox(d):
+    prepared = d.get("preparedId")
+    if prepared is None:
+        task, peer = new_file_task(d, "running")
+    ref, size, checksum = d.get("path"), d.get("size"), d.get("sha256")
+    with OUTBOX_LOCK:
+        if prepared is not None:
+            task = OUTBOX.get(prepared) if isinstance(prepared, str) else None
+            if (not task or task["status"] != "preparing" or task["peerId"] != d.get("peerId")
+                    or task["size"] != size or task["sendMode"] != d.get("sendMode")):
+                raise TransferError("接收邀请已变化，请重新发送", 409)
+            with FILE_LOCK:
+                peer = dict(PEERS.get(task["peerId"], {}))
         path = resolve_media_path(ref)
         if not (path and CACHE_DIR.resolve() in path.parents and path.is_file() and type(size) is int
                 and path.stat().st_size == size and isinstance(checksum, str) and DIGEST.fullmatch(checksum)):
             raise TransferError("发送缓存缺失或不完整，请重新选择文件。")
-        view = update_outbox(task)
+        mode = task["sendMode"]
+        status = "queued" if mode == "offline" else "waiting_accept" if mode == "online" else "running"
+        view = update_outbox(task, path=ref, sha256=checksum, status=status)
         OUTBOX[task["id"]] = task
         if mode != "offline" or time.time() - peer.get("last_seen", 0) < PEER_TIMEOUT:
             start_outbox_worker(task)
@@ -1028,7 +1111,7 @@ def schedule_outbox():
 def outbox_loop():
     while True:
         schedule_outbox()
-        time.sleep(2)
+        time.sleep(1)
 
 
 def control_outbox(tid, action):
@@ -1042,7 +1125,7 @@ def control_outbox(tid, action):
         elif action == "pause" and state == "running" and task.get("control"):
             new_state = "pausing"
         elif action == "cancel" and (state == "cancel_wait" or
-                state in SENDABLE + ("paused", "error") and task.get("control")):
+                state in SENDABLE + ("paused", "error", "preparing") and task.get("control")):
             new_state = "canceling"
         else:
             raise TransferError("任务状态已变化，请查看最新进度。", 409)
@@ -1066,8 +1149,12 @@ class FileWindow:
         self.remaining = size
         self.check = check
         self.progress = progress
+        self.previous = 0
 
     def read(self, amount):
+        if self.previous and self.progress:
+            self.progress(self.previous)
+        self.previous = 0
         if self.check:
             self.check()
         if self.remaining == 0:
@@ -1077,8 +1164,7 @@ class FileWindow:
         if len(data) != count:
             raise TransferError("本机文件缓存不完整，请重新选择文件。")
         self.remaining -= count
-        if self.progress:
-            self.progress(count)
+        self.previous = count
         return data
 
 
@@ -1135,6 +1221,7 @@ def outbox_peer(task, require_control=False):
     peer["resumeMaxChunk"] = transfer_limit(identity.get("resumeMaxChunk"))
     peer["resumeStream"] = identity.get("resumeStream") is True
     peer["receiveModes"] = identity.get("receiveModes") is True
+    peer["prepareOffer"] = identity.get("prepareOffer") is True
     return peer, capability
 
 
@@ -1173,10 +1260,7 @@ def send_outbox_data(task):
                 return
             if not task.get("remoteStarted") or task.get("control") != can_control:
                 update_outbox(task, remoteStarted=True, control=can_control)
-        meta = {k: task[k] for k in ("id", "msgId", "kind", "name", "size", "sha256", "reply", "time")}
-        meta["from"] = ME["id"]
-        meta["sendMode"] = task.get("sendMode", "direct")
-        state = resume_response(*post_to(peer, "/api/file/resume/status", meta),
+        state = resume_response(*post_to(peer, "/api/file/resume/status", outbox_meta(task)),
                                 "接收端未返回续传进度")
         offset = confirmed_offset(task, state)
         with OUTBOX_LOCK:
@@ -1185,8 +1269,9 @@ def send_outbox_data(task):
             if task.get("sendMode") == "online" and state.get("approval") != "accepted":
                 if state.get("approval") != "pending":
                     raise TransferError("对方没有确认接收请求")
-                update_outbox(task, persist=task["status"] != "waiting_accept", status="waiting_accept",
-                              retryAt=time.time()+2, speed=0, error="")
+                if (not task.get("offerConfirmed") or task["status"] != "waiting_accept" or task.get("error")):
+                    update_outbox(task, status="waiting_accept", offerConfirmed=True, speed=0, error="")
+                task["retryAt"] = time.time()+1
                 return
             update_outbox(task, status="running", doneBytes=offset, wireBytes=offset, speed=0, error="")
         conn = http.client.HTTPConnection(peer["ip"], int(peer["http"]), timeout=15, blocksize=256 * 1024)
@@ -1195,24 +1280,26 @@ def send_outbox_data(task):
         try:
             with path.open("rb") as stream:
                 stream.seek(offset)
+                wire = sample_bytes = offset
+                sampled_at = time.monotonic()
+                def check():
+                    if task["status"] != "running":
+                        raise TransferError("传输已停止")
+
+                def news(count):
+                    nonlocal wire, sample_bytes, sampled_at
+                    wire += count
+                    now = time.monotonic()
+                    if now - sampled_at >= .25:
+                        rate = (wire-sample_bytes)/(now-sampled_at)
+                        with OUTBOX_LOCK:
+                            if task["status"] == "running":
+                                current = task["speed"]
+                                update_outbox(task, persist=False, wireBytes=wire,
+                                              speed=round(.7*rate+.3*current if current else rate))
+                        sample_bytes, sampled_at = wire, now
+
                 if peer["resumeStream"] and task["size"] - offset > NETWORK_CHUNK:
-                    first = offset
-                    wire = offset
-                    tick = time.monotonic()
-                    def check():
-                        if task["status"] != "running":
-                            raise TransferError("传输已停止")
-                    def news(count):
-                        nonlocal wire, tick
-                        wire += count
-                        now = time.monotonic()
-                        if now - tick >= .25:
-                            previous = task.get("wireBytes", first)
-                            with OUTBOX_LOCK:
-                                if task["status"] == "running":
-                                    update_outbox(task, persist=False, wireBytes=wire,
-                                                  speed=round((wire-previous)/(now-tick)))
-                            tick = now
                     result = send_chunk(conn, {"id":task["id"],"from":ME["id"],"offset":offset},
                                         stream, task["size"]-offset, continuous=True, check=check, progress=news)
                     offset = confirmed_offset(task, result)
@@ -1224,7 +1311,8 @@ def send_outbox_data(task):
                         return
                     tick = time.monotonic()
                     count = min(batch, task["size"] - offset)
-                    chunk = send_chunk(conn, {"id": task["id"], "from": ME["id"], "offset": offset}, stream, count)
+                    chunk = send_chunk(conn, {"id": task["id"], "from": ME["id"], "offset": offset}, stream, count,
+                                       check=check, progress=news)
                     if confirmed_offset(task, chunk) != offset + count:
                         raise TransferError("接收端确认的分块进度异常，请重试。")
                     offset += count
@@ -1242,7 +1330,8 @@ def send_outbox_data(task):
                 return
             update_outbox(task, status="verifying", speed=0)
         done = resume_response(*post_to(peer, "/api/file/resume/finish",
-                                {"id": task["id"], "from": ME["id"]}, timeout=300),
+                                {"id": task["id"], "from": ME["id"]},
+                                timeout=max(300, 60 + task["size"] / MAX_CHUNK)),
                                "接收端未完成文件校验")
         complete_outbox(task, done)
     finally:
@@ -1308,10 +1397,11 @@ def send_outbox_worker(task):
                   "网络连接或文件操作中断。")
         with OUTBOX_LOCK:
             if mode in SENDABLE and task["status"] in SENDABLE + ("verifying",):
-                if (not isinstance(exc, TransferError) and
-                    (task.get("sendMode") == "offline" or task["status"] == "waiting_accept")):
-                    waiting = "waiting_accept" if task["status"] == "waiting_accept" else "queued"
-                    update_outbox(task, status=waiting, retryAt=time.time()+6, speed=0, error=reason)
+                if not isinstance(exc, TransferError) and task.get("sendMode") == "offline":
+                    update_outbox(task, status="queued", retryAt=time.time()+6, speed=0, error=reason)
+                    return
+                if not isinstance(exc, TransferError) and task["status"] == "waiting_accept" and task.get("offerConfirmed"):
+                    update_outbox(task, retryAt=time.time()+6, speed=0, error=reason)
                     return
                 confirmed = exc.detail.get("offset") if isinstance(exc, TransferError) else None
                 extra = {"doneBytes": confirmed} if type(confirmed) is int and 0 <= confirmed <= task["size"] else {}
@@ -1327,19 +1417,33 @@ def send_outbox_worker(task):
                 start_outbox_worker(task)
 
 
-def receive_progress(record, offset, status="running", path="", error=""):
+def receive_progress(record, offset, status="running", path="", error="", *, wire=None):
     tid = "r-" + ChunkStore.key(record["from"], record["id"])
-    task = dict(id=tid, peerId=record["from"], direction="in", kind=record["kind"],
-                name=record["name"], msgId=record["msgId"], time=record["time"], size=record["size"], doneBytes=offset,
-                speed=0, status=status, start=record["time"] / 1000, path=path, error=error,
-                lastActivity=time.monotonic(), receiveOffer=bool(record.get("approval")))
+    now = time.monotonic()
+    wire = offset if wire is None else wire
     with FILE_LOCK:
+        old = TRANSFERS.get(tid, {})
+        base = old.get("rateBase", offset)
+        tick = old.get("rateAt", now)
+        speed = old.get("speed", 0) if old.get("status") == "running" else 0
+        if status != "running" or old.get("status") != "running" or wire < base:
+            base, tick, speed = wire, now, 0
+        elif now-tick >= .2:
+            sample = (wire-base)/max(.01, now-tick)
+            speed = round(sample if not speed else .7*sample + .3*speed)
+            base, tick = wire, now
+        task = dict(id=tid, peerId=record["from"], direction="in", kind=record["kind"], resumable=True,
+                    name=record["name"], msgId=record["msgId"], time=record["time"], size=record["size"],
+                    doneBytes=offset, wireBytes=wire, speed=speed, status=status, start=record["time"]/1000,
+                    path=path, error=error, lastActivity=now, rateAt=tick, rateBase=base)
         TRANSFERS[tid] = task
         push_progress(task)
     if status == "offered":
         peer = PEERS.get(record["from"], {})
         broadcast({"type": "toast", "from": peer.get("alias") or peer.get("name") or "好友",
                    "text": "有文件待接收：" + record["name"]})
+        if DESKTOP:
+            DESKTOP.on_file_offer(peer, record["name"])
 
 
 def restore_inbox_progress():
@@ -1348,6 +1452,8 @@ def restore_inbox_progress():
             receive_progress(record, offset, "offered")
         elif record.get("paused"):
             receive_progress(record, offset, "paused")
+        elif not record.get("sha256"):
+            receive_progress(record, offset, "waiting_source")
         else:
             receive_progress(record, offset, "waiting", error="等待对方继续传输。")
 
@@ -2552,17 +2658,20 @@ class Handler(BaseHTTPRequestHandler):
         # These actions are initiated by this computer's desktop/web UI only.
         if p in ("/api/peer/ping", "/api/peer/diagnose", "/api/transfer/send-file",
                  "/api/transfer/retry", "/api/transfer/pause", "/api/transfer/cancel",
-                 "/api/transfer/clear-done", "/api/transfer/accept") and not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                 "/api/transfer/clear-done", "/api/transfer/accept", "/api/transfer/prepare-file") and not ipaddress.ip_address(self.client_address[0]).is_loopback:
             return self._json({"ok": False, "error": "请在本机近传中使用此功能"}, 403)
 
         if p in ("/api/peer/ping", "/api/peer/diagnose"):
             return self._json(diagnose_peer(self._body()))
 
-        if p == "/api/transfer/send-file":
+        if p in ("/api/transfer/send-file", "/api/transfer/prepare-file"):
             try:
-                return self._json({"ok": True, "task": start_outbox(self._body())})
+                create = prepare_outbox if p.endswith("/prepare-file") else start_outbox
+                return self._json({"ok": True, "task": create(self._body())})
             except TransferError as e:
                 return self._json({"ok": False, "error": str(e)}, e.status)
+            except (OSError, http.client.HTTPException):
+                return self._json({"ok": False, "error": "对方没有响应。请检查连接，或选择离线发送。"}, 502)
 
         if p in ("/api/transfer/retry", "/api/transfer/pause", "/api/transfer/cancel"):
             try:
@@ -3058,7 +3167,7 @@ class Handler(BaseHTTPRequestHandler):
             d = self._body()
             source = d.get("from", "")
             check_resume_peer(source, self.client_address[0])
-            if action == "status":
+            if action in ("status", "prepare"):
                 if not isinstance(d.get("name"), str) or not isinstance(d.get("msgId"), str) or not d["msgId"]:
                     raise TransferError("缺少文件或消息信息")
                 result = RESUME_STORE.status({
@@ -3068,7 +3177,7 @@ class Handler(BaseHTTPRequestHandler):
                     "msgId": str(d.get("msgId") or "")[:96], "kind": "image" if d.get("kind") == "image" else "file",
                     "time": d.get("time") if type(d.get("time")) is int else now_ms(),
                     "reply": d.get("reply") if isinstance(d.get("reply"), dict) else None,
-                }, receive_progress)
+                }, receive_progress, prepare=action == "prepare")
                 return self._json(result)
             if action == "finish":
                 return self._json(RESUME_STORE.finish(source, d.get("id"), finish_inbox, receive_progress))

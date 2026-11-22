@@ -3,7 +3,7 @@ import hashlib
 import secrets
 import threading
 
-from transfer_resume import MAX_CHUNK, TransferError
+from transfer_resume import BUFFER, NETWORK_CHUNK, TransferError
 
 
 class LocalCache:
@@ -24,7 +24,7 @@ class LocalCache:
             path.open("xb").close()
             self.jobs[tid] = dict(name=name, size=size, offset=0, path=path, temporary=temporary,
                                   digest=hashlib.sha256(), lock=threading.RLock(), ready=False)
-        return {"ok": True, "id": tid, "chunkSize": MAX_CHUNK}
+        return {"ok": True, "id": tid, "chunkSize": NETWORK_CHUNK}
 
     def job(self, tid):
         with self.lock:
@@ -36,17 +36,25 @@ class LocalCache:
     def append(self, tid, offset, length, reader):
         job = self.job(tid)
         with job["lock"]:
-            if (job["ready"] or offset != job["offset"] or not 0 < length <= MAX_CHUNK
+            if (job["ready"] or offset != job["offset"] or not 0 < length <= NETWORK_CHUNK
                     or offset + length > job["size"]):
                 raise TransferError("本机文件缓存进度不匹配", 409, offset=job["offset"])
-            block = reader.read(length)
-            if len(block) != length:
-                raise TransferError("本机文件读取中断", 400)
+            digest = job["digest"].copy()
             with job["path"].open("r+b") as stream:
                 stream.seek(offset)
-                stream.write(block)
-                stream.truncate(offset + length)
-            job["digest"].update(block)
+                try:
+                    left = length
+                    while left:
+                        block = reader.read(min(BUFFER, left))
+                        if not block:
+                            raise TransferError("本机文件读取中断", 400)
+                        stream.write(block)
+                        digest.update(block)
+                        left -= len(block)
+                except (OSError, TransferError):
+                    stream.truncate(offset)
+                    raise
+            job["digest"] = digest
             job["offset"] += length
             return {"ok": True, "offset": job["offset"]}
 

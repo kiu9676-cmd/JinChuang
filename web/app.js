@@ -67,9 +67,17 @@ function acknowledgeVisibleChat(){
 }
 
 /* 全局状态拉取：带序号防乱序（旧快照后到会把刚发出的消息“吞”掉） */
-let stateSeq = 0;
+let stateSeq = 0, inFlightProgress = null;
+function mergeProgress(list, task){
+  const i = list.findIndex(x => x.id === task.id);
+  if(i < 0){ list.push(task); return true; }
+  if((list[i].revision || 0) > (task.revision || 0)) return false;
+  list[i] = task;
+  return true;
+}
 async function getState(){
   const seq = ++stateSeq;
+  const progress = inFlightProgress = new Map();
   try{
     const r = await fetch('/api/state'); const d = await r.json();
     if(!d.ok) return;
@@ -83,6 +91,7 @@ async function getState(){
       }
       prevCounts[p.id] = n;
     }
+    for(const t of progress.values()) mergeProgress(d.transfers,t);
     S = d;
     syncAppearanceFromState();
     unread = Object.assign({}, d.unread || {});
@@ -93,7 +102,10 @@ async function getState(){
       if(i >= 0) S.transfers[i] = t; else S.transfers.push(t);
     }
     renderAll();
+    // Snapshots also update cards in place when their structure hasn't changed.
+    for(const t of S.transfers) if(t.peerId === current && chatTask(t)) updateTransferBubble(t);
   }catch(e){ /* 服务重启中，稍后由 WS 重连恢复 */ }
+  finally{ if(inFlightProgress === progress) inFlightProgress = null; }
 }
 
 /* ---------------- 新消息：声音 / 标题角标 / 浏览器模式系统通知 ---------------- */
@@ -144,15 +156,17 @@ function renderTitle(){
 function connectWS(){
   try{ ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws'); }
   catch(e){ scheduleReconnect(); return; }
-  ws.onopen = () => { setHint('本地服务已连接'); };
+  ws.onopen = () => { setHint('本地服务已连接'); getState(); };
   ws.onmessage = ev => {
     let m; try{ m = JSON.parse(ev.data); }catch(e){ return; }
     if(m.type === 'refresh') getState();
     else if(m.type === 'progress'){
-      const t = m.task, i = S.transfers.findIndex(x => x.id === t.id);
-      if(i >= 0) S.transfers[i] = t; else S.transfers.push(t);
-      if((t.retryable || t.receiveOffer) && t.peerId === current) renderMessages();
-      renderTransfers(); updateBubbleProgress(t.msgId, taskPct(t));
+      const t = m.task, prior = S.transfers.find(x => x.id === t.id);
+      if(!mergeProgress(S.transfers, t)) return;
+      inFlightProgress?.set(t.id,t);
+      if(chatTask(t) && t.peerId === current &&
+          (!prior || prior.status !== t.status || prior.error !== t.error || prior.control !== t.control)) renderMessages();
+      renderTransfers(); updateTransferBubble(t);
     }
     else if(m.type === 'forward-progress'){
       const t = outTasks[m.id];
@@ -170,7 +184,7 @@ function connectWS(){
 }
 function scheduleReconnect(){
   if(wsTimer) return;
-  wsTimer = setTimeout(() => { wsTimer = null; connectWS(); getState(); }, 1500);
+  wsTimer = setTimeout(() => { wsTimer = null; connectWS(); }, 1500);
 }
 function setHint(t, bad){
   const el = $('hint'), detail = bad ? t : '';
@@ -320,7 +334,7 @@ try{
 }catch(e){}
 
 /* ---------------- 渲染 ---------------- */
-function renderAll(){ refreshSendMode(); renderMe(); renderPeers(); renderTransfers(); renderHeader(); renderMessages(); renderChatSearch(); renderOpenProfiles(); renderTitle(); }
+function renderAll(){ renderMe(); renderPeers(); renderTransfers(); renderHeader(); renderMessages(); renderChatSearch(); renderOpenProfiles(); renderTitle(); }
 
 function renderMe(){
   $('meName').textContent = S.me.name || '我';
@@ -519,10 +533,12 @@ function renderHeader(){
 }
 
 const dismissedTransfers = new Set();
-const activeTransfer = t => ['running','pausing','verifying','canceling'].includes(t.status);
+const activeTransfer = t => ['preparing','running','pausing','verifying','canceling'].includes(t.status);
+const chatTask = t => !!(t.msgId && (t.retryable || t.resumable || t.receiveOffer || t.preparing));
 const finishedTransfer = t => ['done','canceled'].includes(t.status);
 function allTasks(){
-  const priority = {running:0,pausing:0,verifying:0,canceling:0,paused:1,error:1,waiting:1,offered:0,queued:1,waiting_accept:1,cancel_wait:1};
+  const priority = {preparing:0,running:0,pausing:0,verifying:0,canceling:0,paused:1,error:1,waiting:1,
+    waiting_source:1,offered:0,queued:1,waiting_accept:1,cancel_wait:1};
   return S.transfers.filter(t => !dismissedTransfers.has(t.id))
     .sort((a,b) => (priority[a.status] ?? 2) - (priority[b.status] ?? 2) || (b.start||0)-(a.start||0));
 }
@@ -533,17 +549,22 @@ const seenT = new Set();
 function tStatusText(t){
   const labels = {
     pausing:'正在暂停', paused:t.direction === 'in' ? '对方已暂停' : '已暂停',
-    verifying:'正在校验', waiting:'等待发送方开始或继续', error:'已中断',
-    queued:'已加入离线队列', waiting_accept:'等待对方接收', offered:'待接收',
+    verifying:'正在校验', waiting:'等待发送方开始或继续', waiting_source:'已接收邀请 · 对方正在读取文件', error:'已中断',
+    queued:'已加入离线队列', waiting_accept:t.offerConfirmed ? '等待对方接收' : '正在通知对方',
+    offered:'待接收',
     canceling:'正在取消', cancel_wait:'等待接收端清理', canceled:'已取消', done:'已完成'
   };
-  if(t.preparing && t.status === 'running') return '正在读取本机文件';
-  if(t.status === 'running') return t.speed ? fmtSpeed(t.speed) : (t.direction === 'in' ? '接收中' : '传输中');
+  if(t.status === 'preparing' || t.preparing && t.status === 'running'){
+    return '读取本机文件' + (t.prepareSpeed ? ' · ' + fmtSpeed(t.prepareSpeed) : '');
+  }
+  if(t.status === 'running'){
+    return (t.direction === 'in' ? '接收中' : '发送中') + (t.speed ? ' · ' + fmtSpeed(t.speed) : '');
+  }
   return labels[t.status] || '等待确认';
 }
 function tMetaText(t){
   if(t.status === 'canceled') return fmtSize(t.size) + ' · 未完成数据已清理';
-  return fmtSize(shownBytes(t)) + ' / ' + fmtSize(t.size) +
+  return fmtSize(transferBytes(t)) + ' / ' + fmtSize(t.size) +
     (t.kind === 'folder' && t.fileCount ? ' · ' + (t.filesDone || 0) + '/' + t.fileCount + ' 个文件' : '');
 }
 function taskActions(t, buttonClass = 'btn', diagnostics = false){
@@ -558,14 +579,19 @@ function taskActions(t, buttonClass = 'btn', diagnostics = false){
   if(t.status === 'paused') html += button('retry', '继续');
   if(t.status === 'error' && (t.retryable || retryActions.has(t.id))) html += button('retry', t.retryable ? '重试' : '重新发送');
   if(t.status === 'cancel_wait') html += button('cancel', '重试清理');
-  if(t.control && ['running','error','paused','queued','waiting_accept'].includes(t.status)) html += button('cancel', '取消', 'transfer-cancel');
+  if(t.control && ['preparing','running','error','paused','queued','waiting_accept'].includes(t.status)) html += button('cancel', '取消', 'transfer-cancel');
   if(diagnostics && ['error','cancel_wait'].includes(t.status) && S.peers.some(peer => peer.id === t.peerId)){
     html += `<button type="button" class="${buttonClass}" data-task-diagnose="${escAttr(t.peerId)}">诊断</button>`;
   }
   return html;
 }
-const showTaskProgress = t => ['running','pausing','paused','verifying','waiting'].includes(t.status);
-const taskPct = t => t.status === 'verifying' || t.status === 'done' ? 100 : pct(t);
+const showTaskProgress = t => ['preparing','running','pausing','paused','verifying','waiting'].includes(t.status);
+const transferBytes = t => t.status === 'preparing' ? t.preparedBytes || 0 : shownBytes(t);
+const taskPct = t => t.status === 'verifying' || t.status === 'done' ? 100 :
+  (t.size ? Math.min(100,Math.floor(transferBytes(t)/t.size*100)) : 0);
+function chatTaskMeta(t){
+  return (showTaskProgress(t) ? tMetaText(t) : fmtSize(t.size)) + ' · ' + tStatusText(t);
+}
 function tItemHTML(t){
   const p = taskPct(t), isFolder = t.kind === 'folder';
   const fresh = seenT.has(t.id) ? '' : ' is-new';
@@ -673,6 +699,13 @@ function updateBubbleProgress(mid, p){
   if(bar) bar.style.width = Math.max(0, Math.min(100, Number(p) || 0)) + '%';
 }
 
+function updateTransferBubble(t){
+  if(t.peerId !== current || !t.msgId) return;
+  updateBubbleProgress(t.msgId,taskPct(t));
+  const meta = $('messages').querySelector('.bubble[data-mid="' + CSS.escape(t.msgId) + '"] .file-meta[data-active]');
+  if(meta){ const summary = chatTaskMeta(t); if(meta.textContent !== summary) meta.textContent = summary; }
+}
+
 function renderMessages(force){
   if(!current || surface !== 'chats') return;
   const box = $('messages');
@@ -680,7 +713,8 @@ function renderMessages(force){
   const pend = (pendingMap[current] || []).slice();
   const stored = new Set(base.map(m => m.msgId));
   for(const t of S.transfers){
-    if(!(t.retryable || t.receiveOffer) || t.peerId !== current || finishedTransfer(t) || stored.has(t.msgId)) continue;
+    if(!chatTask(t) || t.peerId !== current || t.status === 'done' || stored.has(t.msgId)
+      || dismissedTransfers.has(t.id)) continue;
     pend.push({msgId:t.msgId, dir:t.direction, type:t.kind, fileName:t.name, size:t.size, time:t.time,
       status:t.status === 'error' ? 'failed' : t.status, progress:taskPct(t), retryId:t.id, error:t.error, transferControl:t.control});
   }
@@ -801,7 +835,8 @@ function renderMessages(force){
           <div class="file-ico">${ESC(ext)}</div>
           <div class="file-info">
             <div class="file-name" title="${escAttr(m.fileName)}">${ESC(m.fileName || '文件')}</div>
-            <div class="file-meta">${fmtSize(m.size)} · ${m.retryId && task ? tStatusText(task) : (m.status === 'failed' ? '发送失败' : (running ? '传输中' : '已送达'))}</div>
+            <div class="file-meta"${m.retryId && task ? ' data-active' : ''}>${m.retryId && task
+              ? chatTaskMeta(task) : fmtSize(m.size) + ' · ' + (m.status === 'failed' ? '发送失败' : (running ? '传输中' : '已送达'))}</div>
             ${running ? `<div class="progress"><i style="width:${pr}%"></i></div>` : ''}
             ${fileActs}${controls ? `<div class="file-acts transfer-inline">${controls}</div>` : ''}
           </div></div></div>`;
@@ -897,13 +932,12 @@ function selectPeer(id){
 /* ---------------- 待发送草稿：拖拽 / 选择 / 截屏都只入队，不自动发送 ---------------- */
 function saveDraft(){
   if(!current) return;
-  draftMap[current] = { text: $('input').value, groups: drafts, sendMode:$('sendMode').value };
+  draftMap[current] = { text: $('input').value, groups: drafts };
 }
 function loadDraft(pid){
   const d = draftMap[pid] || { text:'', groups:[] };
   $('input').value = d.text || '';
   drafts = d.groups || [];
-  $('sendMode').value = d.sendMode || 'online';
   renderDrafts(); updateSendBtn();
 }
 function queueItems(items){
@@ -936,19 +970,7 @@ function draftSize(g){
                              : g.item.file.size;
 }
 const seenD = new Set();
-function refreshSendMode(){
-  const peer = S.peers.find(x => x.id === current);
-  const file = drafts.some(g => g.kind === 'single');
-  const supported = file && peer?.receiveModes === true;
-  $('sendModeOptions').classList.toggle('hidden',!supported);
-  const hint = $('sendModeHint');
-  const message = supported && drafts.some(g => g.kind === 'folder') ? '发送方式仅用于单文件' :
-    (file && peer && !peer.receiveModes ? '对方版本较旧 · 直接发送' : '');
-  if(hint.textContent !== message) hint.textContent = message;
-  hint.classList.toggle('hidden',!message);
-}
 function renderDrafts(){
-  refreshSendMode();
   const bar = $('draftBar'), list = $('draftList');
   if(!drafts.length){ bar.classList.add('hidden'); list.innerHTML = ''; seenD.clear(); return; }
   bar.classList.remove('hidden');
@@ -990,7 +1012,26 @@ function autoGrow(){
 
 /* ---------------- 发送：文本 + 已确认的附件，一次点击统一发出 ---------------- */
 let sending = false;
-async function sendComposed(){
+function chooseSendMode(peer, groups, pid){
+  const files = groups.filter(g => g.kind === 'single');
+  const total = files.reduce((size,g)=>size+draftSize(g),0);
+  const mixed = files.length !== groups.length;
+  openModal(`<h3>选择发送方式</h3>
+    <p class="sub">给 ${ESC(peer.displayName || peer.name || '好友')}发送 ${files.length} 个文件 · ${fmtSize(total)}
+      ${mixed ? '<br>文件夹仍使用原有的直接发送方式。' : ''}</p>
+    <div class="send-mode-choices">
+      <button type="button" class="btn send-mode-choice" id="sendOnline"><strong>在线发送</strong>
+        <span>先通知对方，对方点「接收」或「另存为」后开始传输。</span></button>
+      <button type="button" class="btn send-mode-choice" id="sendOffline"><strong>离线发送</strong>
+        <span>先保存在本机，等对方在局域网内可达时自动发送。请保持近传运行。</span></button>
+    </div>
+    <div class="modal-actions"><button type="button" class="btn" id="cancelSendMode">取消</button></div>`);
+  for(const [id,mode] of [['sendOnline','online'],['sendOffline','offline']]){
+    $(id).onclick = () => { closeModal(true); if(current === pid) sendComposed(mode); };
+  }
+  $('cancelSendMode').onclick = () => closeModal(true);
+}
+async function sendComposed(mode){
   if(!current){ toast('请先选择一个好友'); return; }
   if(sending) return;                       // 防连点：一次只处理一批
   const pid = current;
@@ -999,7 +1040,11 @@ async function sendComposed(){
   if(!text && !drafts.length) return;
 
   const groups = drafts.slice();
-  const sendMode = $('sendModeOptions').classList.contains('hidden') ? 'direct' : $('sendMode').value;
+  const peer = S.peers.find(x => x.id === pid);
+  const file = groups.some(g => g.kind === 'single');
+  if(!mode && file && peer?.receiveModes){ chooseSendMode(peer, groups, pid); return; }
+  if(file && peer && !peer.receiveModes) toast('对方版本较旧，使用直接发送');
+  const sendMode = mode || 'direct';
   const inputEl = $('input'), btn = $('btnSend');
   sending = true;
   btn.classList.add('loading');
@@ -1138,7 +1183,7 @@ function copyText(t){
 async function cacheFileInfo(name, file, options = {}){
   const started = await API('/api/cache/start', {name,size:file.size,temporary:!!options.temporary});
   if(!started.ok || !started.id || !Number.isInteger(started.chunkSize) || started.chunkSize < 1 ||
-     started.chunkSize > 4 * 1024 * 1024) throw new Error(started.error || '本机缓存初始化失败');
+     started.chunkSize > 32 * 1024 * 1024) throw new Error(started.error || '本机缓存初始化失败');
   const id = started.id;
   try{
     for(let offset=0; offset<file.size;){
@@ -1168,21 +1213,26 @@ async function cacheFileInfo(name, file, options = {}){
 function trackOutTask(task){
   outTasks[task.id] = task;
   S.transfers.push(task);
-  renderTransfers();
+  renderTransfers(); renderMessages();
 }
 function untrackOutTask(task){
   delete outTasks[task.id];
   S.transfers = S.transfers.filter(t => t.id !== task.id);
-  renderTransfers();
+  renderTransfers(); renderMessages();
 }
-function taskInputProgress(task){
-  let last = 0;
+function taskInputProgress(task, preparedId){
+  let last = performance.now(), sampleBytes = 0;
   return bytes => {
-    task.doneBytes = (task.baseBytes || 0) + bytes;
+    const state = preparedId ? S.transfers.find(t => t.id === preparedId) : task;
+    if(preparedId && (!state || state.status !== 'preparing')) throw new Error('发送已取消');
+    if(!state || !(state.preparing || state.status === 'preparing')) return;
+    state.preparedBytes = (task.baseBytes || 0) + bytes;
+    if(state.status !== 'preparing') state.doneBytes = state.preparedBytes;
     const now = performance.now();
-    if(now - last >= 150){
-      last = now;
-      renderTransfers();
+    if(now - last >= 150 || bytes === task.size){
+      state.prepareSpeed = Math.round((bytes-sampleBytes)*1000/Math.max(1, now-last));
+      last = now; sampleBytes = bytes;
+      renderTransfers(); updateTransferBubble(state);
     }
   };
 }
@@ -1271,21 +1321,34 @@ async function sendOne(item, peer, pid, reply, sendMode = 'direct'){
   const isImage = /^image\//.test(item.file.type) ||
     /\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)$/i.test(item.name);
   if(peer.resume === true){
-    const task = {id:uid('t-'), direction:'out', peerId:pid, name:item.name, size:item.file.size,
-      kind:isImage ? 'image' : 'file', doneBytes:0, speed:0, status:'running', preparing:true,
-      start:Date.now()/1000};
-    trackOutTask(task);
+    const meta = {peerId:pid, kind:isImage ? 'image' : 'file', name:item.name, size:item.file.size, reply, sendMode};
+    let preparation, staged;
+    const task = {id:uid('t-'),msgId:uid('m-'),direction:'out',...meta,doneBytes:0,
+      speed:0,status:'preparing',preparing:true,time:Date.now(),start:Date.now()/1000};
+    const early = sendMode === 'online' && peer.prepareOffer;
+    if(!early) trackOutTask(task);
     try{
-      const staged = await cacheFileInfo(item.name,item.file,{progress:taskInputProgress(task)});
-      const response = await API('/api/transfer/send-file',{
-        peerId:pid,kind:task.kind,name:item.name,...staged,reply,sendMode
-      });
+      if(early){
+        const response = await API('/api/transfer/prepare-file',meta);
+        if(!response.ok || !response.task?.id) throw new Error(response.error || '对方没有收到邀请');
+        preparation = response.task.id;
+        mergeProgress(S.transfers,response.task);
+        renderMessages(); renderTransfers();
+      }
+      const progress = taskInputProgress(task, preparation);
+      staged = await cacheFileInfo(item.name,item.file,{progress});
+      const response = await API('/api/transfer/send-file',{...meta,...staged,preparedId:preparation});
       if(!response.ok) throw new Error(response.error || '未能创建发送任务');
-      untrackOutTask(task);
+      if(!early) untrackOutTask(task);
+      if(response.task) mergeProgress(S.transfers,response.task);
       getState();
     }catch(e){
+      const live = preparation && S.transfers.find(t => t.id === preparation);
+      if(live && ['canceling','canceled','cancel_wait'].includes(live.status)) return;
+      if(preparation && (!live || live.status === 'preparing')) await API('/api/transfer/cancel',{id:preparation}).catch(()=>{});
       task.status = 'error'; task.preparing = false; task.error = String(e.message || e);
       rememberRetry(task, () => sendOne(item, latestPeer(pid), pid, reply, sendMode));
+      renderMessages();
       toast('发送失败：' + task.error);
     }
     return;
@@ -1824,16 +1887,12 @@ function openSettings(){
             <span class="set-hint">v${escAttr(S.version || '')}${S.build ? ' · 构建 ' + escAttr(S.build) : ''}${S.frozen ? '' : ' · 源码模式'}</span></span>
           <button class="btn sm" id="mCheckUpdate">检查更新</button>
         </div>
-        <div class="set-row col">
-          <span class="set-text"><span class="set-label">更新源</span>
-            <span class="set-hint">由开发者内置（GitHub Release），不需要设置；有新版会在这里提示</span></span>
-        </div>
         <div class="upd" id="updBox">
           <div class="upd-line">
             <span class="upd-text" id="updText">点「检查更新」看看有没有新版本</span>
             <button class="btn primary sm hidden" id="updAction"></button>
           </div>
-          <pre class="upd-notes hidden" id="updNotes"></pre>
+          <ul class="upd-notes hidden" id="updNotes" aria-label="更新内容"></ul>
           <div class="progress hidden" id="updProgress"><i style="width:0%"></i></div>
         </div>
       </section>
@@ -2004,8 +2063,13 @@ function openSettings(){
       }
       if(r.hasUpdate){
         updState = 'available';
-        updSay(`发现新版本 v${r.latest}（当前 v${r.current}）`, 'new');
-        if(r.notes){ updNotes.textContent = r.notes; updNotes.classList.remove('hidden'); }
+        updSay(`v${r.latest} 更新内容`, 'new');
+        for(const change of r.changes || []){
+          const row = document.createElement('li');
+          row.textContent = change;
+          updNotes.append(row);
+        }
+        updNotes.classList.toggle('hidden', !updNotes.childElementCount);
         if(r.asset && r.asset.url) updBtn('下载更新', () => downloadUpdate(r));
         else updSay(`有 v${r.latest}，但该 Release 没带 exe 附件`, 'bad');
         $('btnSettings').classList.add('has-update');
@@ -2028,8 +2092,7 @@ function openSettings(){
     if(!state.connections) return '正在连接更新源' + suffix + '…';
     if(state.total > 0 && state.bytes >= state.total) return '正在校验更新包' + suffix + '…';
     const speed = state.speed ? ' · ' + fmtSpeed(state.speed) : '';
-    const mode = state.connections > 1 ? '正在并行下载' : '正在下载';
-    return mode + suffix + (state.total ? ' · ' + state.percent + '%' : ' · ' + fmtSize(state.bytes)) + speed;
+    return '正在下载' + suffix + (state.total ? ' · ' + state.percent + '%' : ' · ' + fmtSize(state.bytes)) + speed;
   }
 
   let updResumeTimer = null;
@@ -2361,7 +2424,7 @@ $('btnClearDone').onclick = async () => {
   renderTransfers();
   $('transferHeading').focus({preventScroll:true});
 };
-$('btnSend').onclick = sendComposed;
+$('btnSend').onclick = () => sendComposed();
 $('input').onkeydown = e => {
   if(e.key === 'Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); sendComposed(); }
 };
