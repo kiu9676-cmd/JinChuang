@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/kiu9676-cmd/JinChuang/releases/latest/download/default.exe">下载 Windows 版</a> ·
-  <a href="https://github.com/kiu9676-cmd/JinChuang/archive/refs/tags/v1.6.4.zip">下载 v1.6.4 源码</a> ·
+  <a href="https://github.com/kiu9676-cmd/JinChuang/archive/refs/tags/v1.6.5.zip">下载 v1.6.5 源码</a> ·
   <a href="docs/SHOWCASE.md">功能图览</a> ·
   <a href="#快速开始">快速开始</a> ·
   <a href="docs/USAGE.md">使用手册</a> ·
@@ -33,11 +33,11 @@
 
 [查看完整功能图览：还有取消传输、头像设置、深色模式和四川麻将 →](docs/SHOWCASE.md)
 
-双方使用 v1.6.1 或更新版本时，单聊文件和图片支持暂停、继续、取消。群文件和整目录沿用原有传输方式。
+双方使用 v1.6.5 或更新版本时，单聊文件和图片可以[在线或离线发送](docs/USAGE.md#在线发送与离线发送)：在线由对方先确认，离线在发送端排队。单聊保留暂停、继续、取消与校验；群文件和整目录沿用原有传输方式。
 
 ## 快速开始
 
-**Windows 便携版**：从 [GitHub Release](https://github.com/kiu9676-cmd/JinChuang/releases/tag/v1.6.4) 下载 `default.exe`。从旧版升级时先退出托盘里的旧程序，新版放在原目录运行即可继续使用原有 `data/`。也可在旧版里通过「设置 → 更新」升级。
+**Windows 便携版**：从 [GitHub Release](https://github.com/kiu9676-cmd/JinChuang/releases/tag/v1.6.5) 下载 `default.exe`。从旧版升级时先退出托盘里的旧程序，新版放在原目录运行即可继续使用原有 `data/`。也可在旧版里通过「设置 → 更新」升级。
 
 **从源码运行**：推荐使用 **Python 3.12**。在两台设备上各运行一份：
 

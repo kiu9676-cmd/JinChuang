@@ -110,7 +110,7 @@ button,.peer,.text-btn,.tool,.icon-btn,.draft-x,.draft-clear,.set-close,.btn,
 .icon-btn.has-update::after{
   content:'';position:absolute;top:4px;right:4px;width:7px;height:7px;border-radius:50%;
   background:var(--danger);box-shadow:0 0 0 2px var(--card);
-
+  
 }
 
 .side-head{
@@ -1640,3 +1640,7 @@ button,.peer,.text-btn,.tool,.icon-btn,.draft-x,.draft-clear,.set-close,.btn,
 .t-error>.transfer-cancel,.transfer-inline>.transfer-cancel{color:var(--ink-3)}
 .t-error>.transfer-cancel:hover,.transfer-inline>.transfer-cancel:hover{color:var(--danger,#a72835)}
 .transfer-inline>.file-link{padding:3px 7px;border:1px solid var(--glass-stroke);border-radius:6px}
+.send-mode{display:inline-flex;align-items:center;gap:6px;margin-left:auto;font-size:11px;line-height:1.4;color:var(--muted)}
+.send-mode select{font:inherit;color:inherit;border:1px solid var(--edge);border-radius:7px;padding:4px 5px;background:var(--surface);max-width:100%}
+.send-mode-hint{font-size:11px;color:var(--muted)}
+@media(max-width:540px){.draft-head{flex-wrap:wrap}.send-mode{margin-left:0}}

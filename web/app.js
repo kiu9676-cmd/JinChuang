@@ -34,7 +34,8 @@ const fmtDay = t => { const d = new Date(Number(t)||Date.now()), now = new Date(
   if(sameDay) return fmtTime(t);
   if(d.toDateString() === yest.toDateString()) return '昨天';
   return (d.getMonth()+1) + '-' + d.getDate(); };
-const pct = t => !t.size ? 0 : Math.min(100, Math.round(t.doneBytes / t.size * 100));
+const shownBytes = t => t.status === 'running' ? Math.max(t.doneBytes || 0,t.wireBytes || 0) : (t.doneBytes || 0);
+const pct = t => !t.size ? 0 : Math.min(100, Math.round(shownBytes(t) / t.size * 100));
 const escAttr = s => ESC(s).replace(/'/g,'&#39;');
 const totalUnread = () => Object.values(unread).reduce((a,b) => a+b, 0);
 
@@ -150,7 +151,7 @@ function connectWS(){
     else if(m.type === 'progress'){
       const t = m.task, i = S.transfers.findIndex(x => x.id === t.id);
       if(i >= 0) S.transfers[i] = t; else S.transfers.push(t);
-      if(t.retryable && t.peerId === current) renderMessages();
+      if((t.retryable || t.receiveOffer) && t.peerId === current) renderMessages();
       renderTransfers(); updateBubbleProgress(t.msgId, taskPct(t));
     }
     else if(m.type === 'forward-progress'){
@@ -319,7 +320,7 @@ try{
 }catch(e){}
 
 /* ---------------- 渲染 ---------------- */
-function renderAll(){ renderMe(); renderPeers(); renderTransfers(); renderHeader(); renderMessages(); renderChatSearch(); renderOpenProfiles(); renderTitle(); }
+function renderAll(){ refreshSendMode(); renderMe(); renderPeers(); renderTransfers(); renderHeader(); renderMessages(); renderChatSearch(); renderOpenProfiles(); renderTitle(); }
 
 function renderMe(){
   $('meName').textContent = S.me.name || '我';
@@ -521,7 +522,7 @@ const dismissedTransfers = new Set();
 const activeTransfer = t => ['running','pausing','verifying','canceling'].includes(t.status);
 const finishedTransfer = t => ['done','canceled'].includes(t.status);
 function allTasks(){
-  const priority = {running:0,pausing:0,verifying:0,canceling:0,paused:1,error:1,waiting:1,cancel_wait:1};
+  const priority = {running:0,pausing:0,verifying:0,canceling:0,paused:1,error:1,waiting:1,offered:0,queued:1,waiting_accept:1,cancel_wait:1};
   return S.transfers.filter(t => !dismissedTransfers.has(t.id))
     .sort((a,b) => (priority[a.status] ?? 2) - (priority[b.status] ?? 2) || (b.start||0)-(a.start||0));
 }
@@ -532,7 +533,8 @@ const seenT = new Set();
 function tStatusText(t){
   const labels = {
     pausing:'正在暂停', paused:t.direction === 'in' ? '对方已暂停' : '已暂停',
-    verifying:'正在校验', waiting:'等待对方继续', error:'已中断',
+    verifying:'正在校验', waiting:'等待发送方开始或继续', error:'已中断',
+    queued:'已加入离线队列', waiting_accept:'等待对方接收', offered:'待接收',
     canceling:'正在取消', cancel_wait:'等待接收端清理', canceled:'已取消', done:'已完成'
   };
   if(t.preparing && t.status === 'running') return '正在读取本机文件';
@@ -541,19 +543,22 @@ function tStatusText(t){
 }
 function tMetaText(t){
   if(t.status === 'canceled') return fmtSize(t.size) + ' · 未完成数据已清理';
-  return fmtSize(t.doneBytes) + ' / ' + fmtSize(t.size) +
+  return fmtSize(shownBytes(t)) + ' / ' + fmtSize(t.size) +
     (t.kind === 'folder' && t.fileCount ? ' · ' + (t.filesDone || 0) + '/' + t.fileCount + ' 个文件' : '');
 }
 function taskActions(t, buttonClass = 'btn', diagnostics = false){
-  if(t.direction !== 'out') return '';
   const button = (action, label, extra = '') => `<button type="button" class="${buttonClass} ${extra}"
     data-transfer-command="${action}" data-transfer-id="${escAttr(t.id)}">${label}</button>`;
+  if(t.direction === 'in'){
+    if(t.status !== 'offered') return '';
+    return button('accept', '接收') + (S.desktop ? button('saveAs', '另存为') : '');
+  }
   let html = '';
   if(t.status === 'running' && t.control) html += button('pause', '暂停');
   if(t.status === 'paused') html += button('retry', '继续');
   if(t.status === 'error' && (t.retryable || retryActions.has(t.id))) html += button('retry', t.retryable ? '重试' : '重新发送');
   if(t.status === 'cancel_wait') html += button('cancel', '重试清理');
-  if(t.control && ['running','error','paused'].includes(t.status)) html += button('cancel', '取消', 'transfer-cancel');
+  if(t.control && ['running','error','paused','queued','waiting_accept'].includes(t.status)) html += button('cancel', '取消', 'transfer-cancel');
   if(diagnostics && ['error','cancel_wait'].includes(t.status) && S.peers.some(peer => peer.id === t.peerId)){
     html += `<button type="button" class="${buttonClass}" data-task-diagnose="${escAttr(t.peerId)}">诊断</button>`;
   }
@@ -601,10 +606,11 @@ function renderTransfers(){
   const list = allTasks();
   const box = $('transferList');
   const active = list.filter(activeTransfer).length;
-  const summary = active ? (active + ' 项传输中 · 共 ' + list.length + ' 项') :
-    list.length ? (list.length + ' 项记录') : '暂无传输任务';
+  const offers = list.filter(t => t.status === 'offered').length;
+  const detail = [offers && offers + ' 项待接收', active && active + ' 项传输中'].filter(Boolean);
+  const summary = list.length ? [...detail,list.length + ' 项记录'].join(' · ') : '暂无传输任务';
   if($('transferCount').textContent !== summary) $('transferCount').textContent = summary;
-  $('railTransferDot').hidden = active === 0;
+  $('railTransferDot').hidden = active === 0 && offers === 0;
   $('btnClearDone').classList.toggle('hidden', !list.some(finishedTransfer));
   if(!list.length){
     if(box.dataset.empty !== '1'){ box.innerHTML = '<div class="t-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 8h14m-4.5-4 4 4-4 4m5.5 4h-14m4.5-4-4 4 4 4"/></svg><p>发送或接收文件后，记录会显示在这里。</p></div>'; box.dataset.empty = '1'; }
@@ -674,8 +680,8 @@ function renderMessages(force){
   const pend = (pendingMap[current] || []).slice();
   const stored = new Set(base.map(m => m.msgId));
   for(const t of S.transfers){
-    if(!t.retryable || t.direction !== 'out' || t.peerId !== current || finishedTransfer(t) || stored.has(t.msgId)) continue;
-    pend.push({msgId:t.msgId, dir:'out', type:t.kind, fileName:t.name, size:t.size, time:t.time,
+    if(!(t.retryable || t.receiveOffer) || t.peerId !== current || finishedTransfer(t) || stored.has(t.msgId)) continue;
+    pend.push({msgId:t.msgId, dir:t.direction, type:t.kind, fileName:t.name, size:t.size, time:t.time,
       status:t.status === 'error' ? 'failed' : t.status, progress:taskPct(t), retryId:t.id, error:t.error, transferControl:t.control});
   }
   const list = base.concat(pend).sort((a,b) => (a.time||0)-(b.time||0));
@@ -891,12 +897,13 @@ function selectPeer(id){
 /* ---------------- 待发送草稿：拖拽 / 选择 / 截屏都只入队，不自动发送 ---------------- */
 function saveDraft(){
   if(!current) return;
-  draftMap[current] = { text: $('input').value, groups: drafts };
+  draftMap[current] = { text: $('input').value, groups: drafts, sendMode:$('sendMode').value };
 }
 function loadDraft(pid){
   const d = draftMap[pid] || { text:'', groups:[] };
   $('input').value = d.text || '';
   drafts = d.groups || [];
+  $('sendMode').value = d.sendMode || 'online';
   renderDrafts(); updateSendBtn();
 }
 function queueItems(items){
@@ -929,7 +936,19 @@ function draftSize(g){
                              : g.item.file.size;
 }
 const seenD = new Set();
+function refreshSendMode(){
+  const peer = S.peers.find(x => x.id === current);
+  const file = drafts.some(g => g.kind === 'single');
+  const supported = file && peer?.receiveModes === true;
+  $('sendModeOptions').classList.toggle('hidden',!supported);
+  const hint = $('sendModeHint');
+  const message = supported && drafts.some(g => g.kind === 'folder') ? '发送方式仅用于单文件' :
+    (file && peer && !peer.receiveModes ? '对方版本较旧 · 直接发送' : '');
+  if(hint.textContent !== message) hint.textContent = message;
+  hint.classList.toggle('hidden',!message);
+}
 function renderDrafts(){
+  refreshSendMode();
   const bar = $('draftBar'), list = $('draftList');
   if(!drafts.length){ bar.classList.add('hidden'); list.innerHTML = ''; seenD.clear(); return; }
   bar.classList.remove('hidden');
@@ -980,6 +999,7 @@ async function sendComposed(){
   if(!text && !drafts.length) return;
 
   const groups = drafts.slice();
+  const sendMode = $('sendModeOptions').classList.contains('hidden') ? 'direct' : $('sendMode').value;
   const inputEl = $('input'), btn = $('btnSend');
   sending = true;
   btn.classList.add('loading');
@@ -990,7 +1010,7 @@ async function sendComposed(){
   autoGrow();
   try{
     if(text) await (groupOf(pid) ? sendGroupText(text, reply, pid) : sendText(text, reply, pid));
-    if(groups.length) await (groupOf(pid) ? sendGroupsToGroup(groups, pid) : sendGroups(groups, pid));
+    if(groups.length) await (groupOf(pid) ? sendGroupsToGroup(groups, pid) : sendGroups(groups, pid, sendMode));
   }catch(e){
     // 失败别吞掉用户的内容：文字回填、附件退回待发送区
     toast('发送失败：' + ((e && e.message) || e));
@@ -1200,6 +1220,14 @@ async function setTransferCommand(id, action, button){
 function handleTransferCommand(button){
   const id = button.dataset.transferId, action = button.dataset.transferCommand;
   if(action === 'retry'){ retryTransfer(id, button); return; }
+  if(action === 'accept' || action === 'saveAs'){
+    button.disabled = true;
+    API('/api/transfer/accept',{id,saveAs:action === 'saveAs'}).then(r => {
+      if(!r.ok) throw new Error(r.error || '接收失败');
+      if(!r.cancelled) getState();
+    }).catch(e=>toast(e.message || '接收失败')).finally(()=>{ button.disabled=false; });
+    return;
+  }
   const t = S.transfers.find(item => item.id === id);
   if(!t) return;
   if(action !== 'cancel' || t.status === 'cancel_wait'){
@@ -1236,7 +1264,10 @@ async function uploadTo(peer, item, task, staged, extra){
   return result.path;
 }
 
-async function sendOne(item, peer, pid, reply){
+async function sendOne(item, peer, pid, reply, sendMode = 'direct'){
+  if(sendMode !== 'direct' && (!peer.resume || !peer.receiveModes)){
+    throw new Error('对方版本不支持这项发送方式，文件没有直接发出。');
+  }
   const isImage = /^image\//.test(item.file.type) ||
     /\.(png|jpe?g|gif|webp|bmp|svg|heic|avif)$/i.test(item.name);
   if(peer.resume === true){
@@ -1247,14 +1278,14 @@ async function sendOne(item, peer, pid, reply){
     try{
       const staged = await cacheFileInfo(item.name,item.file,{progress:taskInputProgress(task)});
       const response = await API('/api/transfer/send-file',{
-        peerId:pid,kind:task.kind,name:item.name,...staged,reply
+        peerId:pid,kind:task.kind,name:item.name,...staged,reply,sendMode
       });
       if(!response.ok) throw new Error(response.error || '未能创建发送任务');
       untrackOutTask(task);
       getState();
     }catch(e){
       task.status = 'error'; task.preparing = false; task.error = String(e.message || e);
-      rememberRetry(task, () => sendOne(item, latestPeer(pid), pid, reply));
+      rememberRetry(task, () => sendOne(item, latestPeer(pid), pid, reply, sendMode));
       toast('发送失败：' + task.error);
     }
     return;
@@ -1285,7 +1316,7 @@ async function sendOne(item, peer, pid, reply){
   }catch(e){
     task.status = 'error'; task.preparing = false; task.error = String(e.message || e);
     bubble.status = 'failed';
-    rememberRetry(task, () => sendOne(item, latestPeer(pid), pid, reply));
+    rememberRetry(task, () => sendOne(item, latestPeer(pid), pid, reply, sendMode));
     toast('发送失败：' + (e.message || e));
   }finally{
     const arr = pendingMap[pid] || [];
@@ -1295,16 +1326,16 @@ async function sendOne(item, peer, pid, reply){
   }
 }
 
-async function sendGroups(groups, pid){
+async function sendGroups(groups, pid, sendMode){
   const peer = S.peers.find(p => p.id === pid);
   if(!peer){ toast('好友不存在'); return; }
-  if(!peer.online) toast('对方当前离线，仍会尝试发送');
+  if(!peer.online && sendMode === 'direct') toast('对方当前离线，仍会尝试发送');
   const queue = groups.slice();
   const worker = async () => {
     while(queue.length){
       const g = queue.shift();
       if(g.kind === 'folder') await sendFolder(peer, g, pid, g.reply);
-      else await sendOne(g.item, peer, pid, g.reply);
+      else await sendOne(g.item, peer, pid, g.reply, sendMode);
     }
   };
   await Promise.all([worker(), worker()]);

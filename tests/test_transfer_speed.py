@@ -152,15 +152,19 @@ class ResumeReceiver(QuietHandler):
     def do_POST(self):
         path=urlsplit(self.path)
         length=int(self.headers["Content-Length"])
-        if path.path.endswith("/append"):
+        if path.path.endswith(("/append","/stream")):
             args={k:v[0] for k,v in parse_qs(path.query).items()}
             self.server.parts.append((length,self.client_address[1]))
-            result,_=self.server.store.append(args["from"],args["id"],int(args["offset"]),length,self.rfile)
+            if path.path.endswith("/stream"):
+                result=self.server.store.stream(args["from"],args["id"],int(args["offset"]),length,self.rfile)
+            else:
+                result,_=self.server.store.append(args["from"],args["id"],int(args["offset"]),length,self.rfile)
             time.sleep(self.server.receipt_delay)
         else:
             data=json.loads(self.rfile.read(length))
             if path.path.endswith("/register"):
-                result={"id":"n-peer","resume":True,"transferControl":True}
+                result={"id":"n-peer","resume":True,"transferControl":True,
+                        "receiveModes":True,"resumeStream":self.server.continuous}
                 if self.server.limit:
                     result["resumeMaxChunk"]=self.server.limit
             elif path.path.endswith("/status"):
@@ -173,7 +177,7 @@ class ResumeReceiver(QuietHandler):
 
 
 class LanSpeedTest(unittest.TestCase):
-    def transfer(self, size, limit):
+    def transfer(self, size, limit, continuous=False, online=False):
         with tempfile.TemporaryDirectory() as root:
             root=Path(root).resolve()
             peer_dir=root/"peer"
@@ -184,18 +188,25 @@ class LanSpeedTest(unittest.TestCase):
                 f.truncate(size)
             checksum=digest_file(source)
             recv=ChunkStore(peer_dir,lambda:dest,server.unique_path)
-            with serve(ResumeReceiver,store=recv,parts=[],limit=limit,receipt_delay=.060) as httpd:
+            with serve(ResumeReceiver,store=recv,parts=[],limit=limit,receipt_delay=.060,continuous=continuous) as httpd:
                 task=dict(id="t-file",peerId="n-peer",direction="out",kind="file",name=source.name,
                           size=size,doneBytes=0,speed=0,status="running",path="cache/file.bin",
-                          sha256=checksum,msgId="m-file",start=time.time(),time=server.now_ms(),reply=None)
+                          sha256=checksum,msgId="m-file",start=time.time(),time=server.now_ms(),reply=None,
+                          sendMode="online" if online else "direct")
                 with patch.multiple(server, DATA_DIR=root, PEERS={"n-peer":{"ip":"127.0.0.1","http":httpd.server_port}},
                                     ME={"id":"n-from","name":"test"}, MESSAGES={}, TRANSFERS={},
                                     MESSAGES_FILE=root/"messages.json", DESKTOP=None):
+                    if online:
+                        server.send_outbox_data(task)
+                        self.assertEqual(task["status"],"waiting_accept")
+                        self.assertFalse(httpd.parts)
+                        self.assertFalse(dest.exists())
+                        recv.accept(ChunkStore.key("n-from","t-file"),root/"chosen.bin")
                     before=time.perf_counter()
                     server.send_outbox_data(task)
                     elapsed=time.perf_counter()-before
                     self.assertEqual(task["status"],"done")
-                self.assertEqual(digest_file(dest/"file.bin"),checksum)
+                self.assertEqual(digest_file(root/"chosen.bin" if online else dest/"file.bin"),checksum)
                 return httpd.parts,elapsed
 
     def test_lan_reuses_connection_with_adaptive_batches(self):
@@ -211,3 +222,10 @@ class LanSpeedTest(unittest.TestCase):
         print(f"LAN 64MiB with injected 60ms per receipt: {len(legacy)} receipts / {before:.2f}s "
               f"vs {len(modern)} receipts / {after:.2f}s",flush=True)
 
+
+
+    def test_confirmed_online_stream_has_one_response_for_full_file(self):
+        size=64*1024*1024
+        parts,elapsed=self.transfer(size,NETWORK_CHUNK,continuous=True,online=True)
+        self.assertEqual([length for length,_ in parts],[size])
+        print(f"Confirmed online 64MiB continuous transfer: one data request, {elapsed:.2f}s")

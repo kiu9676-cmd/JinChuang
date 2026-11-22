@@ -296,6 +296,16 @@ class DesktopBridge(object):
             print("[截屏失败]", e)
             return None
 
+    def choose_save_path(self, name):
+        if self.main is None:
+            return None
+        result = self.main.create_file_dialog(
+            webview.SAVE_DIALOG, save_filename=str(name),
+            file_types=("所有文件 (*.*)",))
+        if isinstance(result, tuple):
+            result = result[0] if result else None
+        return result if isinstance(result, str) and result else None
+
     def save_as(self, rel, default_name):
         """原生另存为：把已收到的文件复制到用户选择的位置。"""
         try:

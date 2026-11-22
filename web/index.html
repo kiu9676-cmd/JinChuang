@@ -135,6 +135,14 @@
         <div class="draft-bar hidden" id="draftBar">
           <div class="draft-head">
             <span id="draftCount">待发送</span>
+            <label id="sendModeOptions" class="send-mode hidden" title="此方式用于单聊中的文件和图片">
+              <span>发送方式</span>
+              <select id="sendMode" aria-label="文件发送方式">
+                <option value="online">在线 · 对方确认接收</option>
+                <option value="offline">离线 · 上线后自动送达</option>
+              </select>
+            </label>
+            <span id="sendModeHint" class="send-mode-hint hidden"></span>
             <span class="draft-note">确认后点「发送」才会发出</span>
             <button class="draft-clear" id="draftClear">清空</button>
           </div>

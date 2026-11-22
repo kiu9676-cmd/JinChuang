@@ -84,7 +84,8 @@ class ChunkStore:
 
     def _view(self, record, key):
         return dict(ok=True, offset=self._offset(record), complete=bool(record.get("complete")),
-                    path=("received/" + key + "/" + Path(record["target"]).name) if record.get("complete") else "")
+                    path=("received/" + key + "/" + Path(record["target"]).name) if record.get("complete") else "",
+                    approval=record.get("approval", ""))
 
     def status(self, meta, observe=None):
         key = self.key(meta.get("from"), meta.get("id"))
@@ -93,14 +94,22 @@ class ChunkStore:
             raise TransferError("文件大小或校验值无效")
         with self._lock(key):
             record = read_record(self._path(key))
-            if record is None:
+            fresh = record is None
+            if fresh:
                 part = self.destination().resolve() / ".jinchuan-partials" / (key + ".part")
                 record = dict(meta, part=str(part), offset=0)
+                if record.get("sendMode") == "online":
+                    record["approval"] = "pending"
                 write_record(self._path(key), record)
             elif record.get("canceled"):
                 raise TransferError("这项传输已取消", 410)
-            elif any(record[k] != meta[k] for k in ("name", "size", "sha256", "msgId")):
+            elif (record.get("sendMode", "direct") != meta.get("sendMode", "direct")
+                  or any(record[k] != meta[k] for k in ("name", "size", "sha256", "msgId"))):
                 raise TransferError("这项任务的原文件已变化，需重新发送", 409)
+            if record.get("approval") == "pending":
+                if observe and fresh:
+                    observe(record, 0, "offered")
+                return self._view(record, key)
             if record.get("paused"):
                 record["paused"] = False
                 write_record(self._path(key), record)
@@ -108,6 +117,49 @@ class ChunkStore:
             if observe and not view["complete"]:
                 observe(record, view["offset"])
             return view
+
+    def offered(self, key):
+        if not isinstance(key, str) or not DIGEST.fullmatch(key):
+            raise TransferError("接收邀请不存在", 404)
+        record = self._record(key)
+        if record.get("approval") != "pending" or record.get("canceled"):
+            raise TransferError("该接收邀请状态已变化", 409)
+        return record
+
+    def accept(self, key, selected=None, observe=None):
+        if not isinstance(key, str) or not DIGEST.fullmatch(key):
+            raise TransferError("接收邀请不存在", 404)
+        with self._lock(key):
+            record = self.offered(key)
+            if selected is not None:
+                chosen = Path(selected).resolve()
+                if not chosen.parent.is_dir() or chosen.is_dir():
+                    raise TransferError("另存为位置不可用")
+                record["destinationChoice"] = str(chosen)
+                record["part"] = str(chosen.parent / ".jinchuan-partials" / (key + ".part"))
+            record["approval"] = "accepted"
+            write_record(self._path(key), record)
+            if observe:
+                observe(record, 0, "waiting")
+            return self._view(record, key)
+
+    def stream(self, source, tid, offset, length, reader, observe=None):
+        """Receive one HTTP body, with durable boundaries while it is still arriving."""
+        key = self.key(source, tid)
+        with self._lock(key):
+            record = self._record(key)
+            if record.get("canceled"):
+                raise TransferError("这项传输已取消", 410)
+            if record.get("approval") == "pending":
+                raise TransferError("接收端还没有确认接收", 409)
+            if length <= 0 or offset != self._offset(record) or offset + length > record["size"]:
+                raise TransferError("流式传输范围无效", 409, offset=self._offset(record))
+            while length:
+                count = min(length, NETWORK_CHUNK)
+                self.append(source, tid, offset, count, reader, observe)
+                offset += count
+                length -= count
+            return {"ok": True, "offset": offset}
 
     def control(self, source, tid, action, publish, observe=None):
         key = self.key(source, tid)
@@ -148,7 +200,7 @@ class ChunkStore:
             record = read_record(path)
             if record and not record.get("canceled") and not record.get("complete"):
                 offset = self._offset(record)
-                if offset or record.get("paused"):
+                if offset or record.get("paused") or record.get("approval"):
                     yield record, offset
 
     def append(self, source, tid, offset, length, reader, observe=None):
@@ -160,6 +212,8 @@ class ChunkStore:
             if record.get("canceled"):
                 raise TransferError("这项传输已取消", 410)
             previous = self._offset(record)
+            if record.get("approval") == "pending":
+                raise TransferError("接收端还没有确认接收", 409)
             if record.get("paused"):
                 raise TransferError("这项传输已暂停，请先继续", 409, offset=previous)
             if record.get("complete") or offset != previous or offset + length > record["size"]:
@@ -196,6 +250,8 @@ class ChunkStore:
             if record.get("canceled"):
                 raise TransferError("这项传输已取消", 410)
             if not record.get("complete"):
+                if record.get("approval") == "pending":
+                    raise TransferError("接收端还没有确认接收", 409)
                 if record.get("paused"):
                     raise TransferError("这项传输已暂停，请先继续", 409, offset=self._offset(record))
                 part = Path(record["part"])
@@ -231,7 +287,8 @@ class ChunkStore:
                         raise TransferError("SHA-256 校验未通过，已清除坏数据；重试将从头发送", 422, offset=0)
                     if part.exists():
                         if target is None or target.exists():
-                            target = self.available_name(part.parent.parent / record["name"])
+                            preferred = record.get("destinationChoice")
+                            target = self.available_name(Path(preferred) if preferred else part.parent.parent / record["name"])
                         record["target"] = str(target)
                         write_record(self._path(key), record)
                         if os.name == "nt":
