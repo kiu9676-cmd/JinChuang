@@ -19,6 +19,7 @@ import argparse
 import errno
 import base64
 import hashlib
+import tempfile
 import json
 import mimetypes
 import os
@@ -39,14 +40,15 @@ import webbrowser
 import mj
 import ipaddress
 from local_cache import LocalCache
-from transfer_resume import MAX_CHUNK, DIGEST, ChunkStore, TransferError, read_record, write_record
+from transfer_resume import MAX_CHUNK, NETWORK_CHUNK, DIGEST, ChunkStore, TransferError, read_record, write_record
+from update_download import DownloadError, download_package
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_NAME = "近传"
-VERSION = "1.6.3"
-BUILD_DATE = "2026-11-21"
+VERSION = "1.6.4"
+BUILD_DATE = "2026-11-22"
 WINDOWS_RELEASE_ASSET = "default.exe"
 # 更新源：写死在这里（客户端界面不暴露、不可改）。
 # 仓库：https://github.com/kiu9676-cmd/JinChuang
@@ -270,7 +272,7 @@ def init_store(args):
         "udp": int(CONFIG["udp_port"]),
         "platform": platform.system(),
         "app": APP_NAME,
-        "v": VERSION, "resume": True, "transferControl": True
+        "v": VERSION, "resume": True, "transferControl": True, "resumeMaxChunk": NETWORK_CHUNK
     }
 
 
@@ -398,15 +400,10 @@ def set_autostart(enable):
 # 发版流程见 README「发布新版本」：改版本号 → release.py → GitHub 建 Release
 # 并把 exe 作为 asset 传上去，客户端就能一键更新。
 # ----------------------------------------------------------------------------
-try:
-    for _f in (DATA_DIR / "update").glob("*.part"):
-        _f.unlink()
-except Exception:
-    pass
-
 UPDATE_LOCK = threading.Lock()
 UPDATE = {"state": "idle", "percent": 0, "bytes": 0, "total": 0,
           "path": "", "name": "", "error": "", "version": ""}
+UPDATE_CHECK_LOCK = threading.Lock()
 UPDATE_CACHE = (0.0, None)          # (时间戳, 检查结果)
 
 
@@ -506,6 +503,9 @@ def fetch_latest_release():
         if name.lower().endswith(".exe"):
             asset = {"name": name, "size": int(a.get("size") or 0),
                      "url": a.get("browser_download_url") or ""}
+            digest = str(a.get("digest") or "").lower()
+            if digest.startswith("sha256:") and DIGEST.fullmatch(digest[7:]):
+                asset["sha256"] = digest[7:]
             break
     return {
         "ok": True, "repo": repo, "tag": tag, "latest": latest,
@@ -519,104 +519,101 @@ def fetch_latest_release():
 
 
 def check_update(force=False):
-    """带缓存地检查更新（GitHub 匿名限流 60 次/小时，别每次开面板都打）。"""
+    """Reuse a single in-flight metadata request and avoid caching a connection error for 5 minutes."""
     global UPDATE_CACHE
-    now = time.time()
-    ts, info = UPDATE_CACHE
-    if info and not force and now - ts < 300:
+    asked = time.monotonic()
+    with UPDATE_CHECK_LOCK:
+        ts, info = UPDATE_CACHE
+        if info and (ts >= asked or not force and asked - ts < (300 if info.get("ok") else 10)):
+            return dict(info)
+        info = fetch_latest_release()
+        if info.get("ok"):
+            info["current"] = VERSION
+            info["hasUpdate"] = parse_version(info.get("latest")) > parse_version(VERSION)
+        info["checked"] = int(time.time())
+        UPDATE_CACHE = (time.monotonic(), info)
         return dict(info)
-    info = fetch_latest_release()
-    if info.get("ok"):
-        info["current"] = VERSION
-        info["hasUpdate"] = parse_version(info.get("latest")) > parse_version(VERSION)
-    info["checked"] = int(now)
-    UPDATE_CACHE = (now, info)
-    return dict(info)
 
 
-UPDATE_CANCEL = {"flag": False}
+UPDATE_JOB = None
 
 
 def update_download_live():
-    """当前是否真的在下载（30 秒没有任何进展就算僵尸任务）。"""
-    if UPDATE.get("state") != "downloading":
-        return False
-    return (time.time() - float(UPDATE.get("ts") or 0)) < 30
+    return UPDATE_JOB is not None and UPDATE.get("state") == "downloading"
 
 
 def cancel_update_download():
-    UPDATE_CANCEL["flag"] = True
+    global UPDATE_JOB
     with UPDATE_LOCK:
-        was = UPDATE.get("state") == "downloading"
-        UPDATE.update({"state": "idle", "percent": 0, "bytes": 0, "total": 0,
-                       "error": "", "path": "", "ts": time.time()})
-    try:
-        for f in (DATA_DIR / "update").glob("*.part"):
-            f.unlink()
-    except Exception:
-        pass
-    return was
+        if not update_download_live():
+            return False
+        UPDATE_JOB.set()
+        UPDATE_JOB = None
+        UPDATE.update(state="idle", percent=0, bytes=0, total=0, speed=0, connections=0,
+                      error="", path="", ts=time.time())
+        return True
 
 
-def start_update_download(url, name, size):
-    """返回 (是否成功, 是否已经在跑，即 attached)。"""
+def start_update_download(asset, version):
+    """An update worker owns its temporary file and progress while it is the active job."""
+    global UPDATE_JOB
     with UPDATE_LOCK:
         if update_download_live():
-            return True, True                      # 已经在下载：让前端接上看进度
-        UPDATE_CANCEL["flag"] = False
-        UPDATE.update({"state": "downloading", "percent": 0, "bytes": 0,
-                       "total": int(size or 0), "error": "", "path": "",
-                       "name": name, "version": "", "ts": time.time()})
-    threading.Thread(target=_update_download_worker, args=(url, name, size),
-                     daemon=True).start()
+            return True, True
+        job = threading.Event()
+        UPDATE_JOB = job
+        UPDATE.update(state="downloading", percent=0, bytes=0, total=asset.get("size") or 0,
+                      speed=0, connections=0, error="", path="", name=asset["name"],
+                      version=version, ts=time.time())
+    threading.Thread(target=_update_download_worker, args=(dict(asset), job), daemon=True).start()
     return True, False
 
 
-def _update_download_worker(url, name, size):
+def _update_download_worker(asset, job):
+    global UPDATE_JOB
     dest_dir = DATA_DIR / "update"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    safe = re.sub(r"[^\w.\-\u4e00-\u9fa5]", "_", name or "")[-80:] or "JinChuan.exe"
-    tmp = dest_dir / (safe + ".part")
-    dest = dest_dir / safe
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "JinChuan/" + VERSION})
-        with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
-            total = int(r.headers.get("Content-Length") or size or 0)
-            got = 0
-            while True:
-                chunk = r.read(262144)
-                if not chunk:
-                    break
-                f.write(chunk)
-                got += len(chunk)
-                if UPDATE_CANCEL["flag"]:
-                    raise RuntimeError("已取消")
-                with UPDATE_LOCK:
-                    UPDATE["bytes"] = got
-                    UPDATE["total"] = total or got
-                    UPDATE["percent"] = min(99, int(got * 100 / (total or got or 1)))
-                    UPDATE["ts"] = time.time()
-        if got < 65536:
-            raise RuntimeError("下载内容太小（{} 字节），可能不是安装包".format(got))
-        with open(tmp, "rb") as f:
-            if f.read(2) != b"MZ":
-                raise RuntimeError("下载到的不是 Windows 可执行文件")
-        os.replace(tmp, dest)
+    safe = re.sub(r"[^\w.\-\u4e00-\u9fa5]", "_", asset["name"])[-80:]
+    tmp = None
+    last_time = time.monotonic()
+    last_size = 0
+
+    def progress(got, total, connections):
+        nonlocal last_time, last_size
         with UPDATE_LOCK:
-            UPDATE.update({"state": "ready", "path": str(dest), "percent": 100,
-                           "bytes": got, "total": got})
-    except Exception as e:
-        if str(e) == "已取消":
-            with UPDATE_LOCK:
-                UPDATE.update({"state": "idle", "error": "", "percent": 0,
-                               "bytes": 0, "total": 0, "path": ""})
-        else:
-            with UPDATE_LOCK:
-                UPDATE.update({"state": "error", "error": str(e), "ts": time.time()})
+            if UPDATE_JOB is not job:
+                return
+            now = time.monotonic()
+            elapsed = now - last_time
+            if elapsed >= 0.25:
+                UPDATE["speed"] = round((got - last_size) / elapsed)
+                last_time, last_size = now, got
+            UPDATE.update(bytes=got, total=total, connections=connections, ts=time.time(),
+                          percent=min(99, int(got * 100 / total)) if total else 0)
+
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix="download-", suffix=".part", dir=dest_dir)
+        os.close(fd)
+        tmp = Path(name)
+        got = download_package(asset["url"], tmp, asset.get("size") or 0, asset.get("sha256"),
+                               "JinChuan/" + VERSION, job, progress)
+        with UPDATE_LOCK:
+            if UPDATE_JOB is job and not job.is_set():
+                dest = dest_dir / safe
+                os.replace(tmp, dest)
+                UPDATE.update(state="ready", path=str(dest), percent=100, bytes=got, total=got, speed=0)
+    except (DownloadError, OSError, http.client.HTTPException) as e:
+        with UPDATE_LOCK:
+            if UPDATE_JOB is job:
+                UPDATE.update(state="error", error=str(e), speed=0, ts=time.time())
+    finally:
         try:
-            tmp.unlink()
-        except Exception:
-            pass
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+        finally:
+            with UPDATE_LOCK:
+                if UPDATE_JOB is job:
+                    UPDATE_JOB = None
 
 
 UPDATE_PS1 = """param([int]$TargetPid, [string]$Src, [string]$Dst)
@@ -937,10 +934,10 @@ def outbox_view(task):
     return {k: task[k] for k in TASK_FIELDS if k in task}
 
 
-def update_outbox(task, **changes):
+def update_outbox(task, *, persist=True, **changes):
     with OUTBOX_LOCK:
-        record = dict(task, **changes)
-        write_record(outbox_record(task["id"]), record)
+        if persist:
+            write_record(outbox_record(task["id"]), dict(task, **changes))
         task.update(changes)
         view = outbox_view(task)
         with FILE_LOCK:
@@ -1027,19 +1024,45 @@ def resume_response(status, data, default):
     return data
 
 
-def send_chunk(peer, query, payload):
-    conn = http.client.HTTPConnection(peer["ip"], int(peer["http"]), timeout=15)
-    try:
-        conn.request("POST", "/api/file/resume/append?" + urllib.parse.urlencode(query),
-                     body=payload, headers={"Content-Type": "application/octet-stream"})
-        response = conn.getresponse()
+class FileWindow:
+    """A bounded view of the next N bytes; HTTP never loads the logical batch into memory."""
+    def __init__(self, stream, size):
+        self.stream = stream
+        self.remaining = size
+
+    def read(self, amount):
+        if self.remaining == 0:
+            return b""
+        count = min(amount, self.remaining)
+        data = self.stream.read(count)
+        if len(data) != count:
+            raise TransferError("本机文件缓存不完整，请重新选择文件。")
+        self.remaining -= count
+        return data
+
+
+def transfer_limit(advertised):
+    if type(advertised) is not int:
+        return MAX_CHUNK
+    return max(MAX_CHUNK, min(NETWORK_CHUNK, advertised))
+
+
+def next_batch_size(speed, limit):
+    """Aim for about two seconds between receipts, without exceeding the peer's limit."""
+    window = max(1, int(speed * 2 / MAX_CHUNK)) * MAX_CHUNK
+    return min(limit, max(MAX_CHUNK, window))
+
+
+def send_chunk(conn, query, stream, count):
+    conn.request("POST", "/api/file/resume/append?" + urllib.parse.urlencode(query),
+                 body=FileWindow(stream, count),
+                 headers={"Content-Type": "application/octet-stream", "Content-Length": str(count)})
+    with conn.getresponse() as response:
         try:
             data = json.loads(response.read(8192))
         except ValueError:
             data = {}
         return resume_response(response.status, data, "接收端未确认分块")
-    finally:
-        conn.close()
 
 
 def file_message(record, direction, media):
@@ -1067,6 +1090,7 @@ def outbox_peer(task, require_control=False):
             saved["transferControl"] = capability
             save_peers()
             refresh()
+    peer["resumeMaxChunk"] = transfer_limit(identity.get("resumeMaxChunk"))
     return peer, capability
 
 
@@ -1108,21 +1132,28 @@ def send_outbox_data(task):
                                 "接收端未返回续传进度")
         offset = confirmed_offset(task, state)
         update_outbox(task, doneBytes=offset, speed=0)
-        with path.open("rb") as stream:
-            stream.seek(offset)
-            while offset < task["size"]:
-                if task["status"] != "running":
-                    return
-                tick = time.monotonic()
-                count = min(MAX_CHUNK, task["size"] - offset)
-                payload = stream.read(count)
-                if len(payload) != count:
-                    raise TransferError("本机缓存不完整，请重新选择文件。")
-                chunk = send_chunk(peer, {"id": task["id"], "from": ME["id"], "offset": offset}, payload)
-                if confirmed_offset(task, chunk) != offset + count:
-                    raise TransferError("接收端确认的分块进度异常，请重试。")
-                offset += count
-                update_outbox(task, doneBytes=offset, speed=round(count / max(.01, time.monotonic() - tick)))
+        conn = http.client.HTTPConnection(peer["ip"], int(peer["http"]), timeout=15, blocksize=256 * 1024)
+        limit = peer["resumeMaxChunk"]
+        batch = MAX_CHUNK
+        try:
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                while offset < task["size"]:
+                    if task["status"] != "running":
+                        return
+                    tick = time.monotonic()
+                    count = min(batch, task["size"] - offset)
+                    chunk = send_chunk(conn, {"id": task["id"], "from": ME["id"], "offset": offset}, stream, count)
+                    if confirmed_offset(task, chunk) != offset + count:
+                        raise TransferError("接收端确认的分块进度异常，请重试。")
+                    offset += count
+                    speed = round(count / max(.01, time.monotonic() - tick))
+                    # The receiver persists every confirmed boundary. Persist sender metadata on
+                    # state changes, not every progress tick; a retry queries the receiver again.
+                    update_outbox(task, persist=False, doneBytes=offset, speed=speed)
+                    batch = next_batch_size(speed, limit)
+        finally:
+            conn.close()
         # Committing verification is linearized with user controls, so a cancelled task never
         # concurrently moves bytes into the recipient's final download directory.
         with OUTBOX_LOCK:
@@ -2539,13 +2570,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
 
         # ---------------- 在线更新 ----------------
+        if p.startswith("/api/update/") and not ipaddress.ip_address(self.client_address[0]).is_loopback:
+            return self._json({"ok": False, "error": "此操作只接受本机程序调用"}, 403)
+
         if p == "/api/update/download":
             d = self._body()
-            url = str(d.get("url") or "")
-            if not url.startswith("http"):
-                return self._json({"ok": False, "error": "缺少下载地址"}, 400)
-            ok, attached = start_update_download(url, d.get("name") or "JinChuan.exe",
-                                                 d.get("size") or 0)
+            info = check_update()
+            asset = info.get("asset") or {}
+            if not (info.get("hasUpdate") and asset.get("url") and asset["url"] == d.get("url")
+                    and asset.get("name", "").lower().endswith(".exe")):
+                return self._json({"ok": False, "error": "更新信息已变化或不可用，请重新检查更新。"}, 409)
+            ok, attached = start_update_download(asset, info["latest"])
             if not ok:
                 return self._json({"ok": False, "error": "下载启动失败"}, 400)
             with UPDATE_LOCK:
@@ -2923,8 +2958,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(RESUME_STORE.control(source, d.get("id"), action, finish_inbox, receive_progress))
             raise TransferError("未知文件操作", 404)
         except TransferError as e:
+            self.close_connection = True
             return self._json({"ok": False, "error": str(e), **e.detail}, e.status)
         except OSError as e:
+            self.close_connection = True
             return self._json({"ok": False, "error": "接收文件中断：" + str(e)}, 500)
 
     def _api_file_upload(self, q):

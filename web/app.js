@@ -1991,6 +1991,16 @@ function openSettings(){
     }
   }
 
+  function updateProgressText(state, version){
+    const label = version || state.version;
+    const suffix = label ? ' v' + label : '';
+    if(!state.connections) return '正在连接更新源' + suffix + '…';
+    if(state.total > 0 && state.bytes >= state.total) return '正在校验更新包' + suffix + '…';
+    const speed = state.speed ? ' · ' + fmtSpeed(state.speed) : '';
+    const mode = state.connections > 1 ? '正在并行下载' : '正在下载';
+    return mode + suffix + (state.total ? ' · ' + state.percent + '%' : ' · ' + fmtSize(state.bytes)) + speed;
+  }
+
   let updResumeTimer = null;
 
   function updSafeInfo(){
@@ -2022,7 +2032,7 @@ function openSettings(){
       updBar.classList.remove('hidden');
       const p0 = Math.max(0, Math.min(99, st.percent || 0));
       updBar.querySelector('i').style.width = p0 + '%';
-      updSay('正在下载更新 · ' + p0 + '%（退出面板也会继续）');
+      updSay(updateProgressText(st));
       updBtn('取消下载', cancelDownload);
       pollUpdate(updSafeInfo());
       return;
@@ -2069,7 +2079,7 @@ function openSettings(){
     if(s.state === 'downloading'){
       const p = Math.max(0, Math.min(99, s.percent || 0));
       updBar.querySelector('i').style.width = p + '%';
-      updSay(`正在下载 v${info.latest} · ${p}%`);
+      updSay(updateProgressText(s, info.latest));
       updBtn('取消下载', cancelDownload);
       updResumeTimer = setTimeout(() => pollUpdate(info), 400);
       return;

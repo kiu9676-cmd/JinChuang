@@ -6,8 +6,9 @@ import re
 import threading
 from pathlib import Path
 
-MAX_CHUNK = 4 * 1024 * 1024
-BUFFER = 64 * 1024
+MAX_CHUNK = 4 * 1024 * 1024  # browser intake + old peers
+NETWORK_CHUNK = 32 * 1024 * 1024
+BUFFER = 256 * 1024
 ID = re.compile(r"[A-Za-z0-9_-]{1,96}")
 DIGEST = re.compile(r"[a-f0-9]{64}")
 
@@ -152,7 +153,7 @@ class ChunkStore:
 
     def append(self, source, tid, offset, length, reader, observe=None):
         key = self.key(source, tid)
-        if not 0 < length <= MAX_CHUNK:
+        if not 0 < length <= NETWORK_CHUNK:
             raise TransferError("文件分块长度无效")
         with self._lock(key):
             record = self._record(key)
@@ -256,3 +257,4 @@ class ChunkStore:
             return None
         target = Path(record["target"])
         return target if target.name == bits[2] else None
+
