@@ -1,0 +1,98 @@
+name: Publish verified v1.6.7 builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-jinchuan-v167
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'kiu9676-cmd/JinChuang' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD_SHA: b85bc18f4f0d8b965dfae2ea8313452b24d2220f
+      BUILD_RUN: '45135895440'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: b85bc18f4f0d8b965dfae2ea8313452b24d2220f
+          persist-credentials: false
+      - name: Validate the original platform build results
+        shell: bash
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN" > build.json
+          jq -e --arg sha "$BUILD_SHA" '.head_sha == $sha and .event == "workflow_dispatch" and .status == "completed"' build.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN/jobs" > jobs.json
+          jq -e '[.jobs[] | select(.name == "windows" or (.name | startswith("mac (")))] | length == 3 and all(.[]; .conclusion == "success")' jobs.json
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          github-token: ${{ github.token }}
+          run-id: 45135895440
+          pattern: jinchuan-release-*
+          merge-multiple: true
+          path: packages
+      - name: Upload and verify the installer assets, then publish
+        shell: bash
+        run: |
+          tag=v1.6.7
+          name="近传 $tag"
+          root="repos/$GITHUB_REPOSITORY"
+          endpoint="$root/releases"
+          test "$(gh api "$endpoint/latest" --jq .tag_name)" = v1.6.6
+          curl --fail --location --retry 3 --max-time 90 -o packages/third-party-notices.zip "https://github.com/$GITHUB_REPOSITORY/releases/download/v1.6.6/third-party-notices.zip"
+          echo 'b3de37bd5873c21389364ab3ff19c0c3fbcc23b0728c0f20591242d73c410e21  packages/third-party-notices.zip' | sha256sum -c -
+          awk '/^## v1[.]6[.]7 / {in_release=1; next} /^## / && in_release {exit} in_release {print}' CHANGELOG.md > notes.md
+          test -s notes.md
+          cat >> notes.md <<'NOTES'
+          **Windows**：下载 `default.exe`。退出旧版后更换程序，并保留 `data/`。
+
+          **Mac**：Apple 芯片需 macOS 15+；Intel Ventura 包需 macOS 13.7+。从旧 Mac 版升级请先手动安装本版，此后可在「设置 → 更新」下载 PKG 并打开安装器。安装包未经过 Apple 公证。
+          NOTES
+          if gh api "$root/git/ref/tags/$tag" > tag.json 2>/dev/null; then
+            jq -e --arg sha "$BUILD_SHA" '.object.sha == $sha' tag.json
+          else
+            gh api --method POST "$root/git/refs" -f "ref=refs/tags/$tag" -f "sha=$BUILD_SHA" --jq .object.sha
+          fi
+          gh api "$endpoint?per_page=100" > releases.json
+          jq -e --arg tag "$tag" 'all(.[]; .tag_name != $tag or .draft == true)' releases.json
+          jq --arg tag "$tag" --arg name "$name" --arg sha "$BUILD_SHA" --rawfile body notes.md -n             '{tag_name:$tag, target_commitish:$sha, name:$name, body:$body, draft:true, prerelease:false}' > payload.json
+          draft_id="$(jq -r --arg tag "$tag" --arg name "$name" --arg sha "$BUILD_SHA" '
+            [.[] | select(.draft == true and (.tag_name == $tag or (.name == $name and .target_commitish == $sha)))] |
+            if length == 0 then "" elif length == 1 then .[0].id else error("Multiple release drafts") end' releases.json)"
+          if [[ -z "$draft_id" ]]; then
+            gh api --method POST "$endpoint" --input payload.json > draft.json
+          else
+            gh api --method PATCH "$endpoint/$draft_id" --input payload.json > draft.json
+          fi
+          release_id="$(jq -er '.id | numbers' draft.json)"
+          jq -e --arg tag "$tag" '.tag_name == $tag and .draft == true' draft.json
+          upload="https://uploads.github.com/$root/releases/$release_id/assets"
+          files=(default.exe JinChuan-v1.6.7-macOS-arm64.pkg JinChuan-v1.6.7-macOS-Ventura-x86_64.pkg third-party-notices.zip)
+          for file in "${files[@]}"; do
+            test -s "packages/$file"
+            digest="sha256:$(sha256sum "packages/$file" | cut -d ' ' -f 1)"
+            existing="$(jq -r --arg name "$file" '.assets[] | select(.name == $name) | .digest' draft.json)"
+            if [[ -z "$existing" ]]; then
+              curl --silent --show-error --fail-with-body --max-time 100                 --header "Authorization: Bearer $GH_TOKEN" --header "Content-Type: application/octet-stream"                 --data-binary "@packages/$file" "$upload?name=$file" > uploaded.json
+              jq -e --arg name "$file" --arg digest "$digest" '.name == $name and .digest == $digest and .state == "uploaded"' uploaded.json
+            else
+              test "$existing" = "$digest"
+            fi
+          done
+          gh api "$endpoint/$release_id" > release-verified.json
+          jq -e '.assets | length == 4' release-verified.json
+          for file in "${files[@]}"; do
+            digest="sha256:$(sha256sum "packages/$file" | cut -d ' ' -f 1)"
+            jq -e --arg name "$file" --arg digest "$digest" 'any(.assets[]; .name == $name and .digest == $digest and .state == "uploaded")' release-verified.json
+          done
+          gh api --method PATCH "$endpoint/$release_id" -F draft=false -f make_latest=true --jq .html_url
+          test "$(gh api "$endpoint/latest" --jq .tag_name)" = "$tag"
+          test "$(gh api "$root/git/ref/tags/$tag" --jq .object.sha)" = "$BUILD_SHA"
