@@ -14,8 +14,8 @@ class ResumeReceiverTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.data = Path(self.tmp.name) / "app"
-        self.downloads = Path(self.tmp.name) / "my-downloads"
+        self.data = Path(self.tmp.name).resolve() / "app"
+        self.downloads = Path(self.tmp.name).resolve() / "my-downloads"
         self.store = self.make_store()
         self.body = b"123456789"
         self.meta = {"from": "n-one", "id": "t-one", "name": "sample.bin",
@@ -86,7 +86,7 @@ class ResumeReceiverTest(unittest.TestCase):
         self.store.status(self.meta)
         ref = self.finish()["path"]
         previous = self.downloads
-        self.downloads = Path(self.tmp.name) / "next-downloads"
+        self.downloads = Path(self.tmp.name).resolve() / "next-downloads"
         recovered = self.make_store().media_path(ref)
         self.assertEqual(recovered.parent, previous)
         self.assertEqual(recovered.read_bytes(), b"")
@@ -169,7 +169,7 @@ class ResumeSenderTest(unittest.TestCase):
 
     def test_two_canceled_jobs_sharing_cache_remove_it_once(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             cache = root / "cache"
             cache.mkdir()
             file = cache / "shared.bin"
