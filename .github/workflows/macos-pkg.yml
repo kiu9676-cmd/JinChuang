@@ -43,7 +43,12 @@ jobs:
           plutil -create xml1 requirements.plist
           plutil -insert os -json '["15.0"]' requirements.plist
           plutil -insert arch -json "[\"$ARCH\"]" requirements.plist
-          productbuild --product requirements.plist --component "$app" /Applications "$stem.pkg"
+          # Do not let Installer redirect the payload to a previously unzipped copy.
+          pkgbuild --analyze --root unpacked components.plist
+          plutil -replace 0.BundleIsRelocatable -bool NO components.plist
+          pkgbuild --root unpacked --component-plist components.plist --install-location /Applications --identifier com.jinchuan.app.installer --version 1.6.6 component.pkg
+          productbuild --synthesize --product requirements.plist --package component.pkg Distribution
+          productbuild --distribution Distribution --package-path . "$stem.pkg"
           pkgutil --expand "$stem.pkg" expanded
           test -f expanded/Distribution
       - name: Install into Applications and start its WebKit window
