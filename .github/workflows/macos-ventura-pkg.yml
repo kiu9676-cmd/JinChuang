@@ -1,0 +1,139 @@
+name: Build Intel Ventura PKG for v1.6.6
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jinchuan-macos-ventura-pkg-v166
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.repository == 'kiu9676-cmd/JinChuang' && github.ref == 'refs/heads/main'
+    runs-on: macos-15-intel
+    timeout-minutes: 10
+    env:
+      APP_ZIP_SHA256: 4855f9d1258069afa7eaae5b4a8f8da1b4d7cb0af8543f7ea17ef75e27fbddef
+      MIN_OS: '13.7'
+      INSTALLER_FILE: JinChuan-v1.6.6-macOS-Ventura-x86_64.pkg
+    steps:
+      - name: Build a native installer from the verified app
+        shell: bash
+        run: |
+          test "$(uname -m)" = x86_64
+          stem="JinChuan-v1.6.6-macOS-x86_64"
+          curl --fail --location --retry 3 --max-time 90 -o "$stem.zip" "https://github.com/kiu9676-cmd/JinChuang/releases/download/v1.6.6/$stem.zip"
+          printf '%s  %s.zip\n' "$APP_ZIP_SHA256" "$stem" | shasum -a 256 -c -
+          ditto -x -k "$stem.zip" unpacked
+          app="unpacked/JinChuan.app"
+          codesign --verify --deep --strict "$app"
+          test "$(lipo -archs "$app/Contents/MacOS/JinChuan")" = x86_64
+          python3 - "$app" "$MIN_OS" <<'PY'
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          app = Path(sys.argv[1])
+          def version(text):
+              parts = tuple(int(x) for x in text.split("."))
+              return (parts + (0, 0))[:3]
+          target = version(sys.argv[2])
+          audited = 0
+          for file in sorted(app.rglob("*")):
+              if file.is_symlink() or not file.is_file():
+                  continue
+              with file.open("rb") as source:
+                  header = source.read(8)
+              if len(header) != 8 or header[:4].hex() != "cffaedfe":
+                  if header[:4].hex() in ("cafebabe", "cafebabf", "feedfacf", "cefaedfe"):
+                      raise RuntimeError(f"Unexpected native binary: {file}")
+                  continue
+              if header[4:8].hex() != "07000001":
+                  raise RuntimeError(f"Not an Intel x86_64 binary: {file}")
+              commands = subprocess.check_output(["otool", "-l", str(file)], text=True)
+              versions = re.findall(
+                  r"cmd LC_VERSION_MIN_MACOSX\n\s+cmdsize [0-9]+\n\s+version ([0-9.]+)"
+                  r"|cmd LC_BUILD_VERSION\n\s+cmdsize [0-9]+\n\s+platform (?:MACOS|1)\n\s+minos ([0-9.]+)",
+                  commands, re.IGNORECASE)
+              versions = [value for match in versions for value in match if value]
+              if not versions or any(version(value) > target for value in versions):
+                  raise RuntimeError(f"{file}: deployment version {versions} exceeds {sys.argv[2]} or is missing")
+              audited += 1
+          assert audited >= 80, f"Not all bundled binaries were checked: {audited}"
+          print(f"Checked {audited} Intel binaries against macOS {sys.argv[2]}")
+          PY
+          info="$app/Contents/Info.plist"
+          plutil -replace LSMinimumSystemVersion -string "$MIN_OS" "$info"
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          plutil -create xml1 requirements.plist
+          plutil -insert os -json "[\"$MIN_OS\"]" requirements.plist
+          plutil -insert arch -json '["x86_64"]' requirements.plist
+          # Do not let Installer redirect the payload to a previously unzipped copy.
+          pkgbuild --analyze --root unpacked components.plist
+          plutil -replace 0.BundleIsRelocatable -bool NO components.plist
+          pkgbuild --root unpacked --component-plist components.plist --install-location /Applications --identifier com.jinchuan.app.installer --version 1.6.6 component.pkg
+          productbuild --synthesize --product requirements.plist --package component.pkg Distribution
+          productbuild --distribution Distribution --package-path . "$INSTALLER_FILE"
+          pkgutil --expand "$INSTALLER_FILE" expanded
+          grep -F "$MIN_OS" expanded/Distribution
+          grep -F x86_64 expanded/Distribution
+      - name: Install into Applications and start its WebKit window
+        shell: bash
+        timeout-minutes: 4
+        run: |
+          test ! -e /Applications/JinChuan.app
+          sudo /usr/sbin/installer -verbose -pkg "$INSTALLER_FILE" -target /
+          app=/Applications/JinChuan.app
+          test "$(plutil -extract LSMinimumSystemVersion raw -o - "$app/Contents/Info.plist")" = "$MIN_OS"
+          codesign --verify --deep --strict "$app"
+          cmp "unpacked/JinChuan.app/Contents/MacOS/JinChuan" "$app/Contents/MacOS/JinChuan"
+          data="$(mktemp -d)"
+          if ! "$app/Contents/MacOS/JinChuan" --smoke-test --data-dir "$data"; then
+            cat "$data/lanbridge.log"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: JinChuan-v1.6.6-macOS-Ventura-x86_64-installer
+          path: JinChuan-v1.6.6-macOS-Ventura-x86_64.pkg
+          if-no-files-found: error
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: JinChuan-v1.6.6-macOS-Ventura-x86_64-installer
+          path: installers
+      - name: Add only the Ventura installer
+        shell: bash
+        run: |
+          endpoint="repos/$GITHUB_REPOSITORY/releases/tags/v1.6.6"
+          gh api "$endpoint" > before.json
+          jq -e '.id == 454311488 and .draft == false and .immutable == false' before.json
+          filename="JinChuan-v1.6.6-macOS-Ventura-x86_64.pkg"
+          digest="sha256:$(sha256sum "installers/$filename" | cut -d ' ' -f 1)"
+          existing="$(jq -r --arg name "$filename" '.assets[] | select(.name == $name) | .digest' before.json)"
+          if [[ -z "$existing" ]]; then
+            gh release upload --repo "$GITHUB_REPOSITORY" v1.6.6 "installers/$filename"
+          else
+            test "$existing" = "$digest"
+          fi
+          gh api "$endpoint" > after.json
+          jq -e --arg name "$filename" --slurpfile before before.json '
+            ([.assets[] | select(.name != $name) | [.id, .name, .digest, .size]] | sort) ==
+            ([$before[0].assets[] | select(.name != $name) | [.id, .name, .digest, .size]] | sort)
+          ' after.json
+          jq -e --arg name "$filename" --arg digest "$digest" '
+            any(.assets[]; .name == $name and .digest == $digest and .state == "uploaded")
+          ' after.json
