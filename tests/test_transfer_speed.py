@@ -141,6 +141,24 @@ class ParallelUpdateTest(unittest.TestCase):
         with self.assertRaisesRegex(DownloadError,"SHA-256"):
             self.copy(digest="0"*64)
 
+    def test_pkg_download_requires_checksum_and_correct_format(self):
+        content = b"xar!" + b"v" * 65536
+        with tempfile.TemporaryDirectory() as temp, serve(
+                UpdateSource, accepts_ranges=False, content=content, wrong_range=False, interrupt=False,
+                slow=False, lock=threading.Lock(), active=0, peak=0, calls=[]) as source:
+            url = f"http://127.0.0.1:{source.server_port}/start"
+            dest = Path(temp)/"update.part"
+            def fetch(digest, kind):
+                return download_package(url,dest,len(content),digest,"test",threading.Event(),lambda *_:None,kind=kind)
+            with self.assertRaises(DownloadError):
+                fetch(None,"pkg")
+            with self.assertRaisesRegex(DownloadError,"格式"):
+                fetch(sha256(content).hexdigest(),"exe")
+            with self.assertRaisesRegex(DownloadError,"SHA-256"):
+                fetch("0"*64,"pkg")
+            self.assertEqual(fetch(sha256(content).hexdigest(),"pkg"),len(content))
+            self.assertEqual(dest.read_bytes(),content)
+
     def test_cancellation_does_not_finish(self):
         cancelled=threading.Event()
         cancelled.set()

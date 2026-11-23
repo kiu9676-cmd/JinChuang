@@ -32,7 +32,7 @@ node --test tests/mahjong-engine.test.cjs tests/clipboard.test.cjs
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
-.\.venv\Scripts\python.exe release.py --build-only --no-git --no-zip --version 1.6.6
+.\.venv\Scripts\python.exe release.py --build-only --no-git --no-zip --version 1.6.7
 ```
 
 产物为 `dist/近传.exe`，也可用 `build.bat` 打包。若要发布新版本，核对 `server.py` 中的版本号、`CHANGELOG.md` 和附件哈希；在 GitHub Release 用 `vX.Y.Z` 作为标签，附上已验证的 `.exe`。派生项目应按需设置自己的更新源。
@@ -49,6 +49,10 @@ bash build.sh
 ```
 
 产物为 `dist/JinChuan.app` 和对应架构的 ZIP。也可在 GitHub Actions 手动运行 **Build macOS app**，分别构建 Apple 芯片（arm64）和 Intel（x86_64），并从 ZIP 解包后验证原生 WebKit 窗口。公开下载包在没有开发者证书时仅进行本机签名，不代表通过 Apple 公证。
+
+### 发布当前版本
+
+GitHub Actions 的 **Build and publish v1.6.7** 从同一提交构建 Windows、Apple 芯片 Mac 与 Intel Ventura Mac 安装包；必须全部通过测试与包验证才会发布。如果修改 Intel 最低系统版本，须复核所有内置二进制的最低系统版本，不能只改安装器的要求。
 
 ## 提交前
 

@@ -17,7 +17,7 @@ VERSION="$("$PYTHON" -c 'from release import read_version; print(read_version())
   --workpath build_tmp --specpath . --distpath dist macos_app.py
 APP=dist/JinChuan.app
 INFO="$APP/Contents/Info.plist"
-"$PYTHON" - "$INFO" "$VERSION" <<'PY'
+"$PYTHON" - "$INFO" "$VERSION" "${MACOS_MIN_VERSION:-15.0}" <<'PY'
 import plistlib
 from pathlib import Path
 import sys
@@ -28,7 +28,7 @@ info.update(
     CFBundleDisplayName="近传",
     CFBundleShortVersionString=sys.argv[2],
     CFBundleVersion=sys.argv[2],
-    LSMinimumSystemVersion="15.0",
+    LSMinimumSystemVersion=sys.argv[3],
     NSLocalNetworkUsageDescription="近传使用局域网查找设备并直接传输消息和文件。",
     NSAppTransportSecurity={"NSAllowsLocalNetworking": True},
 )

@@ -47,8 +47,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_NAME = "近传"
-VERSION = "1.6.6"
-BUILD_DATE = "2026-11-22"
+VERSION = "1.6.7"
+BUILD_DATE = "2026-11-23"
 WINDOWS_RELEASE_ASSET = "default.exe"
 # 更新源：写死在这里（客户端界面不暴露、不可改）。
 # 仓库：https://github.com/kiu9676-cmd/JinChuang
@@ -259,6 +259,14 @@ def init_store(args):
 
     PEERS = load_json(PEERS_FILE, {}).get("peers", {})
     MESSAGES = load_json(MESSAGES_FILE, {})
+    interrupted = False
+    for conversation in MESSAGES.values():
+        for msg in conversation:
+            if msg.get("dir") == "out" and msg.get("status") == "sending":
+                msg["status"] = "failed"
+                interrupted = True
+    if interrupted:
+        save_messages()
     load_groups()
     for pid, p in PEERS.items():
         p["online"] = False
@@ -461,7 +469,8 @@ def fallback_release_info(repo):
         "ok": True, "repo": repo, "tag": tag, "latest": tag.lstrip("vV"),
         "changes": [], "publishedAt": "", "fallback": True,
         "htmlUrl": "https://github.com/{}/releases/tag/{}".format(repo, tag),
-        "asset": {"name": WINDOWS_RELEASE_ASSET, "size": 0, "url": asset_url},
+        "asset": ({"name": WINDOWS_RELEASE_ASSET, "size": 0, "url": asset_url, "kind": "exe"}
+                  if platform.system() == "Windows" else None),
         "current": VERSION,
         "hasUpdate": parse_version(tag) > parse_version(VERSION),
     }
@@ -487,6 +496,42 @@ def release_changes(body):
         if text and text not in changes:
             changes.append(text)
     return changes[:20]
+
+
+def release_asset(data, tag):
+    """Only accept the package that matches this running platform and its minimum OS."""
+    system = platform.system()
+    assets = {a.get("name"): a for a in data.get("assets", []) if isinstance(a, dict)
+              and a.get("state", "uploaded") == "uploaded"}
+    if system == "Windows":
+        names = [WINDOWS_RELEASE_ASSET]
+        kind = "exe"
+    elif system == "Darwin" and re.fullmatch(r"v[0-9]+[.][0-9]+[.][0-9]+", tag):
+        ver = parse_version(platform.mac_ver()[0]) + (0, 0)
+        arch = platform.machine().lower()
+        stem = f"JinChuan-{tag}-macOS"
+        names = []
+        if arch == "x86_64" and ver[:3] >= (13, 7, 0):
+            names.append(stem + "-Ventura-x86_64.pkg")
+        if arch in ("arm64", "x86_64") and ver[:3] >= (15, 0, 0):
+            names.append(stem + f"-{arch}.pkg")
+        kind = "pkg"
+    else:
+        return None
+    for name in names:
+        row = assets.get(name)
+        if not row or not row.get("browser_download_url"):
+            continue
+        size = row.get("size", 0)
+        digest = str(row.get("digest") or "").lower()
+        sha = digest[7:] if digest.startswith("sha256:") and DIGEST.fullmatch(digest[7:]) else ""
+        if kind == "pkg" and (not sha or type(size) is not int or size <= 0):
+            continue
+        result = {"name": name, "size": size, "url": row["browser_download_url"], "kind": kind}
+        if sha:
+            result["sha256"] = sha
+        return result
+    return None
 
 
 def fetch_latest_release():
@@ -520,16 +565,7 @@ def fetch_latest_release():
 
     tag = str(data.get("tag_name") or data.get("name") or "")
     latest = tag.lstrip("vV") or str(data.get("name") or "")
-    asset = None
-    for a in data.get("assets") or []:
-        name = str(a.get("name") or "")
-        if name.lower().endswith(".exe"):
-            asset = {"name": name, "size": int(a.get("size") or 0),
-                     "url": a.get("browser_download_url") or ""}
-            digest = str(a.get("digest") or "").lower()
-            if digest.startswith("sha256:") and DIGEST.fullmatch(digest[7:]):
-                asset["sha256"] = digest[7:]
-            break
+    asset = release_asset(data, tag)
     return {
         "ok": True, "repo": repo, "tag": tag, "latest": latest,
         "changes": release_changes(str(data.get("body") or "")),
@@ -587,7 +623,7 @@ def start_update_download(asset, version):
         UPDATE_JOB = job
         UPDATE.update(state="downloading", percent=0, bytes=0, total=asset.get("size") or 0,
                       speed=0, connections=0, error="", path="", name=asset["name"],
-                      version=version, ts=time.time())
+                      version=version, kind=asset.get("kind", "exe"), checksum=asset.get("sha256", ""), ts=time.time())
     threading.Thread(target=_update_download_worker, args=(dict(asset), job), daemon=True).start()
     return True, False
 
@@ -619,7 +655,7 @@ def _update_download_worker(asset, job):
         os.close(fd)
         tmp = Path(name)
         got = download_package(asset["url"], tmp, asset.get("size") or 0, asset.get("sha256"),
-                               "JinChuan/" + VERSION, job, progress)
+                               "JinChuan/" + VERSION, job, progress, kind=asset.get("kind", "exe"))
         with UPDATE_LOCK:
             if UPDATE_JOB is job and not job.is_set():
                 dest = dest_dir / safe
@@ -670,10 +706,31 @@ Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force
 def apply_update(dry_run=False):
     """把已下载的新 exe 换上去并重启。返回 (ok, message, script_path)。"""
     with UPDATE_LOCK:
-        state, src = UPDATE["state"], UPDATE["path"]
+        state, src, kind = UPDATE["state"], UPDATE["path"], UPDATE.get("kind", "exe")
+        checksum = UPDATE.get("checksum", "")
     if state != "ready" or not src or not Path(src).is_file():
         return False, "还没有下载好的更新包", ""
     frozen = bool(getattr(sys, "frozen", False))
+    if kind == "pkg":
+        path = Path(src).resolve()
+        if platform.system() != "Darwin" or path.suffix != ".pkg" or path.parent != (DATA_DIR/"update").resolve():
+            return False, "更新包与当前系统不匹配", ""
+        try:
+            with path.open("rb") as package:
+                unchanged = bool(checksum) and hashlib.file_digest(package, "sha256").hexdigest() == checksum
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            return False, "安装包校验失败，请重新下载", ""
+        if dry_run:
+            return True, "dry-run", ""
+        if not frozen:
+            return False, "当前为源码模式，请从发布页更新", ""
+        try:
+            subprocess.run(["/usr/bin/open", "-a", "Installer", str(path)], check=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False, "系统安装器启动失败，请重新打开安装包", ""
+        return True, "已打开系统安装器，安装后重新打开近传", ""
     dst = str(Path(sys.executable).resolve()) if frozen else str(Path(src))
     script = DATA_DIR / "update" / "apply_update.ps1"
     script.parent.mkdir(parents=True, exist_ok=True)
@@ -1626,11 +1683,12 @@ def add_message(peer_id, msg):
         for old in arr:
             if mid and old.get("msgId") == mid:
                 for k, v in msg.items():
-                    if v not in (None, ""):
+                    if k != "localTime" and v not in (None, ""):
                         old[k] = v
                 save_messages()
                 refresh()
                 return old
+        msg["localTime"] = now_ms()
         arr.append(msg)
         if len(arr) > 800:
             del arr[:len(arr) - 800]
@@ -1646,6 +1704,17 @@ def add_message(peer_id, msg):
                 pass
     refresh()
     return msg
+
+
+def finish_message_send(conversation, mid, status):
+    """Update the existing bubble in place, even when a reply arrived during the POST."""
+    with FILE_LOCK:
+        for msg in reversed(MESSAGES.get(conversation, [])):
+            if msg.get("msgId") == mid and msg.get("status") == "sending":
+                msg["status"] = status
+                save_messages()
+                refresh()
+                return
 
 
 # ----------------------------------------------------------------------------
@@ -2214,6 +2283,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "只能撤回自己发的消息"}, 400)
                 if target.get("type") == "recalled":
                     return self._json({"ok": True})
+                if target.get("status") == "sending":
+                    return self._json({"ok": False, "error": "等消息发出后再撤回"}, 409)
                 if now_ms() - int(target.get("time") or 0) > 120000:
                     return self._json({"ok": False, "error": "超过 2 分钟，无法撤回"}, 400)
                 target["type"] = "recalled"
@@ -2801,7 +2872,7 @@ class Handler(BaseHTTPRequestHandler):
             info = check_update()
             asset = info.get("asset") or {}
             if not (info.get("hasUpdate") and asset.get("url") and asset["url"] == d.get("url")
-                    and asset.get("name", "").lower().endswith(".exe")):
+                    and asset.get("kind") in ("exe", "pkg")):
                 return self._json({"ok": False, "error": "更新信息已变化或不可用，请重新检查更新。"}, 409)
             ok, attached = start_update_download(asset, info["latest"])
             if not ok:
@@ -2963,6 +3034,8 @@ class Handler(BaseHTTPRequestHandler):
             "time": d.get("time") or now_ms(),
             "status": "sending"
         }
+        add_message(pid, out)
+        status = "failed"
         if peer:
             payload = {
                 "msgId": mid, "from": ME["id"], "fromName": ME["name"], "fromAvatarKey": ME["avatarKey"],
@@ -2975,15 +3048,13 @@ class Handler(BaseHTTPRequestHandler):
             # 对方已离线就别让界面干等 5 秒：先用短超时试一下，失败立刻标记
             online = time.time() - peer.get("last_seen", 0) < PEER_TIMEOUT
             try:
-                status, _ = post_to(peer, "/api/message", payload,
+                code, _ = post_to(peer, "/api/message", payload,
                                     timeout=5 if online else 1.5)
-                out["status"] = "done" if status == 200 else "failed"
+                status = "done" if code == 200 else "failed"
             except Exception:
-                out["status"] = "failed"
-        else:
-            out["status"] = "failed"
-        add_message(pid, out)
-        return self._json({"ok": out["status"] != "failed", "status": out["status"]})
+                status = "failed"
+        finish_message_send(pid, mid, status)
+        return self._json({"ok": status != "failed", "status": status})
 
     def _api_group_send(self, d):
         """本地发群消息：先落自己的库，再扇出给每个在线成员。"""
@@ -3012,12 +3083,13 @@ class Handler(BaseHTTPRequestHandler):
         media_by_peer = d.get("peerMediaById")
         if not isinstance(media_by_peer, dict):
             media_by_peer = None
-        sent, failed = fanout_group(g, "/api/group/message", payload, media_by_peer=media_by_peer)
-        out["status"] = "done" if sent else "failed"
         add_message(gid, out)
+        sent, failed = fanout_group(g, "/api/group/message", payload, media_by_peer=media_by_peer)
+        status = "done" if sent else "failed"
+        finish_message_send(gid, mid, status)
         g["updatedAt"] = now_ms()
         save_groups()
-        return self._json({"ok": sent > 0, "status": out["status"],
+        return self._json({"ok": sent > 0, "status": status,
                            "sent": sent, "failed": failed})
 
     def _api_local_cache(self, action, q):

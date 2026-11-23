@@ -400,7 +400,7 @@ function renderPeers(){
           <span class="peer-name">${ESC(p.displayName)}</span>
           ${p.mute?'<span class="mute-ico" title="消息免打扰">🔇</span>':''}
           ${p.pinned?'<span class="pin">置顶</span>':''}
-          <span class="peer-time">${last?fmtDay(last.time):''}</span>
+          <span class="peer-time">${last?fmtDay(shownMessageTime(last)):''}</span>
         </div>
         <div class="peer-msg">${last?ESC(msgPreviewText(last)):'<span class="peer-group-inline">'+ (p.group?ESC(p.group)+' · ':'') + ESC(p.platform||'') +'</span>'}</div>
       </div>
@@ -422,7 +422,7 @@ function renderPeers(){
       <div class="peer-main">
         <div class="peer-row1">
           <span class="peer-name">${ESC(g.name||'群聊')}<span class="g-tag">群</span></span>
-          <span class="peer-time">${last?fmtDay(last.time):''}</span>
+          <span class="peer-time">${last?fmtDay(shownMessageTime(last)):''}</span>
         </div>
         <div class="peer-msg">${preview}</div>
       </div>
@@ -665,6 +665,8 @@ function mediaURL(path){ return '/api/media?path=' + encodeURIComponent(path||''
 /* ---------------- 消息渲染：连发折叠 / 日期分组 / 增量刷新 ---------------- */
 let msgSig = '';
 let seenMessages = new Set();
+let chatTimeline = [];
+const shownMessageTime = message => Number(message?.localTime ?? message?.time) || 0;
 
 function dayLabel(t){
   const d = new Date(Number(t) || Date.now()), now = new Date();
@@ -718,7 +720,16 @@ function renderMessages(force){
     pend.push({msgId:t.msgId, dir:t.direction, type:t.kind, fileName:t.name, size:t.size, time:t.time,
       status:t.status === 'error' ? 'failed' : t.status, progress:taskPct(t), retryId:t.id, error:t.error, transferControl:t.control});
   }
-  const list = base.concat(pend).sort((a,b) => (a.time||0)-(b.time||0));
+  // The server stores new messages in local arrival order, not the remote device's clock.
+  // Keep a visible transfer in its existing slot when its completion becomes a saved message.
+  const timeline = new Map();
+  base.concat(pend.filter(m => !stored.has(m.msgId))).forEach((message, index) => {
+    timeline.set(message.msgId || `legacy:${index}`, message);
+  });
+  const oldOrder = chatTimeline.filter(id => timeline.has(id));
+  const known = new Set(oldOrder);
+  chatTimeline = oldOrder.concat([...timeline.keys()].filter(id => !known.has(id)));
+  const list = chatTimeline.map(id => timeline.get(id));
   const p = convOf(current) || {};
   const inGroup = isGroupConv(current);
   const mine = S.me || {};
@@ -728,7 +739,7 @@ function renderMessages(force){
   const profileSig = [mine.avatarKey,mine.name,p.avatarKey,p.displayName,p.name,
     ...Array.from(members,([id,person]) => [id,person?.avatarKey,profileName(person)])];
   const sig = JSON.stringify(profileSig) + current + '#' + list.map(m => [m.msgId, m.dir, m.type, m.status || '',
-      m.fileName || '', m.size || 0, (m.text || '').slice(0, 80), m.time || 0,
+      m.fileName || '', m.size || 0, (m.text || '').slice(0, 80), shownMessageTime(m),
       m.media || '', m.error || '', m.transferControl || false, m.reply ? (m.reply.name || '') + '|' + (m.reply.text || '') : ''
     ].join('~')).join('|');
 
@@ -753,7 +764,7 @@ function renderMessages(force){
     const prev = items[items.length - 1];
     if(m.type === 'recalled' && prev && prev.type === 'recalled' && prev.dir === m.dir){
       prev._n = (prev._n || 1) + 1;
-      prev.time = m.time;
+      prev.localTime = shownMessageTime(m);
       continue;
     }
     items.push(Object.assign({}, m, { _n: 0 }));
@@ -762,7 +773,7 @@ function renderMessages(force){
   let html = '', lastDay = '', prevItem = null;
 
   items.forEach(m => {
-    const t = Number(m.time) || Date.now();
+    const t = shownMessageTime(m) || Date.now();
     const day = new Date(t).toDateString();
     if(day !== lastDay){
       html += `<div class="day"><span>${dayLabel(t)}</span></div>`;
@@ -781,15 +792,16 @@ function renderMessages(force){
       return;
     }
 
+    const elapsed = t - shownMessageTime(prevItem);
     const chain = !!(prevItem && prevItem.dir === m.dir &&
       (out || !inGroup || (m.from && prevItem.from === m.from)) &&
-      (t - (Number(prevItem.time) || 0)) < 180000);
+      elapsed >= 0 && elapsed < 180000);
     const senderName = !out && inGroup && !chain ? authorName : '';
     const senderAvatar = author?.avatarKey || m.fromAvatarKey;
     let inner = '';
     const quote = m.reply
       ? `<div class="quote"><b>${ESC(m.reply.name || '')}</b>${ESC(m.reply.text || '')}</div>` : '';
-    const canRecall = out && m.msgId && (Date.now() - t) < RECALL_MS && m.status !== 'failed';
+    const canRecall = out && m.msgId && (Date.now() - t) < RECALL_MS && !['failed','sending'].includes(m.status);
     const acts = `<div class="msg-acts">
         <button data-reply="${escAttr(m.msgId)}" data-rname="${escAttr(authorName)}"
           data-rtext="${escAttr(msgPreviewText(m))}">回复</button>
@@ -919,7 +931,7 @@ function selectPeer(id){
   surface = 'chats';
   chatScroll = null;
   saveDraft();
-  if(current !== id){ closeChatSearch(); msgSig = ''; seenMessages.clear(); }
+  if(current !== id){ closeChatSearch(); msgSig = ''; seenMessages.clear(); chatTimeline = []; }
   current = id; setReply(null);
   loadDraft(id);
   $('input').focus({preventScroll:true});
@@ -1054,7 +1066,10 @@ async function sendComposed(mode){
   saveDraft(); renderDrafts(); updateSendBtn();
   autoGrow();
   try{
-    if(text) await (groupOf(pid) ? sendGroupText(text, reply, pid) : sendText(text, reply, pid));
+    if(text){
+      scrollMessagesToBottom(false);
+      await (groupOf(pid) ? sendGroupText(text, reply, pid) : sendText(text, reply, pid));
+    }
     if(groups.length) await (groupOf(pid) ? sendGroupsToGroup(groups, pid) : sendGroups(groups, pid, sendMode));
   }catch(e){
     // 失败别吞掉用户的内容：文字回填、附件退回待发送区
@@ -2070,11 +2085,10 @@ function openSettings(){
           updNotes.append(row);
         }
         updNotes.classList.toggle('hidden', !updNotes.childElementCount);
-        if(S.platform === 'Darwin'){
-          updBtn('打开 Mac 下载页', () => window.open(
-            'https://github.com/kiu9676-cmd/JinChuang/releases/latest', '_blank', 'noopener,noreferrer'));
-        }else if(r.asset && r.asset.url) updBtn('下载更新', () => downloadUpdate(r));
-        else updSay(`有 v${r.latest}，但该 Release 没带 exe 附件`, 'bad');
+        if(r.asset && r.asset.url) updBtn('下载更新', () => downloadUpdate(r));
+        else if(S.platform === 'Darwin') updBtn('查看发布页', () => window.open(
+          'https://github.com/kiu9676-cmd/JinChuang/releases/latest', '_blank', 'noopener,noreferrer'));
+        else updSay(`有 v${r.latest}，但没有适用的安装包`, 'bad');
         $('btnSettings').classList.add('has-update');
       }else{
         updState = 'latest';
@@ -2099,6 +2113,15 @@ function openSettings(){
   }
 
   let updResumeTimer = null;
+
+  function showReadyUpdate(state){
+    const mac = state.kind === 'pkg';
+    updState = 'ready';
+    updBar.classList.remove('hidden');
+    updBar.querySelector('i').style.width = '100%';
+    updSay(mac ? '安装包已下载，打开系统安装器继续' : '更新包已下载完成，重启后生效', 'ok');
+    updBtn(mac ? '打开安装器' : '重启并更新', () => applyUpdate(mac));
+  }
 
   function updSafeInfo(){
     return { latest: (updInfo && updInfo.latest) || '', asset: (updInfo && updInfo.asset) || {} };
@@ -2134,15 +2157,7 @@ function openSettings(){
       pollUpdate(updSafeInfo());
       return;
     }
-    if(st.state === 'ready'){
-      updState = 'ready';
-      updAction.classList.remove('hidden');
-      updBar.classList.remove('hidden');
-      updBar.querySelector('i').style.width = '100%';
-      updSay('更新包已下载完成，重启后生效', 'ok');
-      updBtn('重启并更新', applyUpdate);
-      return;
-    }
+    if(st.state === 'ready'){ showReadyUpdate(st); return; }
     if(st.state === 'error' && st.error){
       updSay('上次下载失败：' + st.error, 'bad');
       updBtn('重试', () => checkUpdate(true));
@@ -2181,25 +2196,19 @@ function openSettings(){
       updResumeTimer = setTimeout(() => pollUpdate(info), 400);
       return;
     }
-    if(s.state === 'ready'){
-      updBar.querySelector('i').style.width = '100%';
-      updState = 'ready';
-      updSay(`v${info.latest} 已下载完成，重启后生效`, 'ok');
-      updBtn('重启并更新', applyUpdate);
-      return;
-    }
+    if(s.state === 'ready'){ showReadyUpdate(s); return; }
     updState = 'error';
     updBar.classList.add('hidden');
     updSay('下载失败：' + (s.error || '未知错误'), 'bad');
     updBtn('重试', () => downloadUpdate(info));
   }
 
-  async function applyUpdate(){
+  async function applyUpdate(mac){
     updAction.disabled = true;
-    updSay('正在替换程序并重启…');
+    updSay(mac ? '正在打开系统安装器…' : '正在替换程序并重启…');
     try{
       const r = await API('/api/update/apply', {});
-      if(r && r.ok) updSay('程序会自己重启，稍等一下', 'ok');
+      if(r && r.ok) updSay(mac ? '请在安装器中继续，安装后重新打开近传' : '程序会自己重启，稍等一下', 'ok');
       else { updSay((r && r.error) || '更新失败', 'bad'); updAction.disabled = false; }
     }catch(e){
       updSay('更新失败：' + ((e && e.message) || e), 'bad');

@@ -49,8 +49,11 @@ def expected_length(headers, expected):
     return total
 
 
-def download_package(url, target, expected, digest, agent, cancelled, progress):
+def download_package(url, target, expected, digest, agent, cancelled, progress, *, kind="exe"):
     """Return received size. progress(bytes,total,connections) uses unique bytes, not retries."""
+    headers = {"exe": b"MZ", "pkg": b"xar!"}
+    if kind not in headers or kind == "pkg" and not digest:
+        raise DownloadError("更新包缺少受支持的格式或完整性信息")
     if not 0 <= expected <= PACKAGE_LIMIT:
         raise DownloadError("发布记录中的更新包大小无效")
     if digest and not SHA.fullmatch(digest):
@@ -185,10 +188,11 @@ def download_package(url, target, expected, digest, agent, cancelled, progress):
 
     check_cancel()
     if got < 65536:
-        raise DownloadError("下载内容太小，可能不是 Windows 更新包")
+        raise DownloadError("下载内容太小，可能不是更新包")
     with target.open("rb") as downloaded:
-        if downloaded.read(2) != b"MZ":
-            raise DownloadError("下载到的不是 Windows 可执行文件")
+        magic = headers[kind]
+        if downloaded.read(len(magic)) != magic:
+            raise DownloadError("下载到的文件格式与更新包不匹配")
         if digest:
             downloaded.seek(0)
             sha = hashlib.sha256()
