@@ -37,6 +37,19 @@ py -3.12 -m venv .venv
 
 产物为 `dist/近传.exe`，也可用 `build.bat` 打包。若要发布新版本，核对 `server.py` 中的版本号、`CHANGELOG.md` 和附件哈希；在 GitHub Release 用 `vX.Y.Z` 作为标签，附上已验证的 `.exe`。派生项目应按需设置自己的更新源。
 
+## 构建 macOS 版
+
+在 macOS 15 或更新版本上用与目标一致的 Python 3.12 架构构建：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-macos.txt
+bash build.sh
+```
+
+产物为 `dist/JinChuan.app` 和对应架构的 ZIP。也可在 GitHub Actions 手动运行 **Build macOS app**，分别构建 Apple 芯片（arm64）和 Intel（x86_64），并从 ZIP 解包后验证原生 WebKit 窗口。公开下载包在没有开发者证书时仅进行本机签名，不代表通过 Apple 公证。
+
 ## 提交前
 
 - 请勿提交 `data/`、真实聊天截图、日志、缓存、打包产物、访问令牌或个人配置。

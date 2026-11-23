@@ -1853,12 +1853,12 @@ function openSettings(){
             <span class="set-hint">收到新消息时轻响一声</span></span>
           ${switchHTML('fSound', c.sound !== false)}
         </div>
-        <div class="set-row">
+        ${isWin ? `<div class="set-row">
           <span class="set-text"><span class="set-label">关闭窗口时最小化到托盘</span>
             <span class="set-hint">程序继续在后台接收文件</span></span>
           ${switchHTML('fTray', c.close_to_tray !== false)}
         </div>
-        ${isWin ? `<div class="set-row">
+        <div class="set-row">
           <span class="set-text"><span class="set-label">开机自动启动</span>
             <span class="set-hint">静默进入托盘，不开窗口</span></span>
           ${switchHTML('fAuto', !!c.autostart)}
@@ -1995,7 +1995,7 @@ function openSettings(){
       manual_peers: $('fPeers').value.split(/[\n,]/).map(x => x.trim()).filter(Boolean),
       dnd: isSwitchOn('fDnd'),
       sound: isSwitchOn('fSound'),
-      close_to_tray: isSwitchOn('fTray'),
+      close_to_tray: isWin ? isSwitchOn('fTray') : c.close_to_tray,
       theme: segValue('theme') || openTheme,
       motion: segValue('motion') || openMotion
     };
@@ -2070,7 +2070,10 @@ function openSettings(){
           updNotes.append(row);
         }
         updNotes.classList.toggle('hidden', !updNotes.childElementCount);
-        if(r.asset && r.asset.url) updBtn('下载更新', () => downloadUpdate(r));
+        if(S.platform === 'Darwin'){
+          updBtn('打开 Mac 下载页', () => window.open(
+            'https://github.com/kiu9676-cmd/JinChuang/releases/latest', '_blank', 'noopener,noreferrer'));
+        }else if(r.asset && r.asset.url) updBtn('下载更新', () => downloadUpdate(r));
         else updSay(`有 v${r.latest}，但该 Release 没带 exe 附件`, 'bad');
         $('btnSettings').classList.add('has-update');
       }else{
