@@ -1,5 +1,5 @@
 """Collect redistributable dependencies' installed notices for the Mac bundle."""
-from importlib.metadata import distributions
+from importlib.metadata import distributions, version
 from pathlib import Path
 import platform
 import shutil
@@ -28,6 +28,21 @@ def main(root):
                 dest = root / name / relative
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, dest)
+    # The PyObjC 13.0 core wheel omits its LICENSE from dist-info. Use the license
+    # from the exact source release used to build that installed wheel.
+    core = version("pyobjc-core")
+    if not all(p.isdigit() for p in core.split(".")):
+        raise ValueError("PyObjC needs a stable source tag for license collection")
+    if "pyobjc-core" not in found:
+        target = root / "pyobjc-core"
+        target.mkdir(exist_ok=True)
+        source = f"https://raw.githubusercontent.com/ronaldoussoren/pyobjc/v{core}/pyobjc-core/License.txt"
+        with urlopen(source, timeout=25) as res:
+            body = res.read()
+        if b"Permission is hereby granted" not in body:
+            raise RuntimeError("The PyObjC upstream license text did not match")
+        (target / "License.txt").write_bytes(body)
+        found.add("pyobjc-core")
     required = {"pywebview", "pillow", "pyinstaller", "pyobjc-core", "pyobjc-framework-cocoa", "pyobjc-framework-webkit"}
     missing = required - found
     if missing:
